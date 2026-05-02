@@ -14,7 +14,8 @@
 # 3. Installs the appropriate dependency set for the platform
 # 4. Creates .env from template (if not exists)
 # 5. Symlinks the 'hermes' CLI command into a user-facing bin dir
-# 6. Runs the setup wizard (optional)
+# 6. Installs/starts macOS launchd/Login Items declared by the repo
+# 7. Runs the setup wizard (optional)
 # ============================================================================
 
 set -e
@@ -350,6 +351,12 @@ else
         echo -e "${GREEN}✓${NC} Skills copied"
     fi
 fi
+
+# ============================================================================
+# macOS launchd/Login Items
+# ============================================================================
+
+SETUP_PYTHON="$SETUP_PYTHON" "$SCRIPT_DIR/scripts/install_macos_login_items.sh"
 
 # ============================================================================
 # Done

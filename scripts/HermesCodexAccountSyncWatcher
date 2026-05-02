@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""Long-running CodexMaintainerMenubar -> Hermes auth sync watcher.
+
+This watcher belongs in the hermes-agent checkout so the account-order sync is
+repo-owned instead of something an AI assistant manually runs. It watches the
+Menubar persisted row order and Codex auth snapshots, then runs the one-shot
+sync script with --apply whenever those inputs change.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Iterable
+
+HOME = Path.home()
+APP_ROWS_PATH = HOME / "Library/Application Support/CodexMaintainerMenubar/last-menu-rows.json"
+HERMES_AUTH_PATH = HOME / ".hermes/auth.json"
+CODEX_HOME = HOME / ".codex"
+DEFAULT_INTERVAL_SECONDS = 5.0
+
+
+def sync_script_path() -> Path:
+    return Path(__file__).resolve().with_name("reorder_codex_by_menubar_quota.py")
+
+
+def _safe_stat(path: Path) -> tuple[str, int, int] | None:
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None
+    return (str(path), int(stat.st_mtime_ns), int(stat.st_size))
+
+
+def watched_files() -> list[Path]:
+    files = [APP_ROWS_PATH, HERMES_AUTH_PATH, CODEX_HOME / "auth.json"]
+    if CODEX_HOME.exists():
+        files.extend(sorted(CODEX_HOME.glob("auth.*.json")))
+    return files
+
+
+def fingerprint(paths: Iterable[Path] | None = None) -> str:
+    payload = []
+    for path in paths or watched_files():
+        payload.append(_safe_stat(path))
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def log_event(event: dict) -> None:
+    event = {"ts": dt.datetime.now(dt.timezone.utc).isoformat(), **event}
+    print(json.dumps(event, ensure_ascii=False), flush=True)
+
+
+def run_sync(script_path: Path | None = None) -> dict:
+    script_path = script_path or sync_script_path()
+    cmd = [sys.executable, str(script_path), "--apply", "--quiet"]
+    proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0:
+        return {
+            "ok": False,
+            "exit_code": proc.returncode,
+            "stderr_tail": (proc.stderr or proc.stdout).splitlines()[-3:],
+        }
+    try:
+        payload = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        return {"ok": False, "exit_code": 0, "stderr_tail": [f"invalid sync JSON: {exc}"]}
+    return {
+        "ok": True,
+        "applied": bool(payload.get("applied")),
+        "changed": bool(payload.get("changed")),
+        "provider_synced": bool(payload.get("provider_synced")),
+        "added_entries": len(payload.get("added_entries") or []),
+        "removed_entries": len(payload.get("removed_entries") or []),
+        "matched_entries": len(payload.get("matched_entries") or []),
+        "ranked_rows": len(payload.get("ranked_rows") or []),
+        "backup_created": bool(payload.get("backup")),
+    }
+
+
+def watch(interval: float = DEFAULT_INTERVAL_SECONDS, once: bool = False) -> int:
+    last_fingerprint: str | None = None
+    while True:
+        current = fingerprint()
+        if current != last_fingerprint:
+            result = run_sync()
+            log_event({"event": "sync", **result})
+            last_fingerprint = fingerprint()
+        if once:
+            return 0
+        time.sleep(max(interval, 1.0))
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Watch CodexMaintainerMenubar rows and auto-sync Hermes auth.json")
+    parser.add_argument("--interval", type=float, default=DEFAULT_INTERVAL_SECONDS, help="Polling interval in seconds")
+    parser.add_argument("--once", action="store_true", help="Run one change-detection pass and exit")
+    args = parser.parse_args(argv)
+    return watch(interval=args.interval, once=args.once)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
