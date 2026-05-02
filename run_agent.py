@@ -705,6 +705,25 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
     return "{}"
 
 
+def _coerce_stream_text(value: Any, field_name: str) -> Optional[str]:
+    """Return streamed text only when it is a real string.
+
+    Mock objects and other non-string values can leak into streaming chunks
+    during tests or provider edge cases. Skip them instead of letting them
+    reach string joins and crash the session.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    logger.warning(
+        "Skipping non-string %s from streaming response: %s",
+        field_name,
+        type(value).__name__,
+    )
+    return None
+
+
 def _strip_non_ascii(text: str) -> str:
     """Remove non-ASCII characters, replacing with closest ASCII equivalent or removing.
 
@@ -6782,18 +6801,23 @@ class AIAgent:
                     model_name = chunk.model
 
                 # Accumulate reasoning content
-                reasoning_text = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+                reasoning_text = _coerce_stream_text(
+                    getattr(delta, "reasoning_content", None)
+                    or getattr(delta, "reasoning", None),
+                    "reasoning content",
+                )
                 if reasoning_text:
                     reasoning_parts.append(reasoning_text)
                     _fire_first_delta()
                     self._fire_reasoning_delta(reasoning_text)
 
                 # Accumulate text content — fire callback only when no tool calls
-                if delta and delta.content:
-                    content_parts.append(delta.content)
+                content_text = _coerce_stream_text(getattr(delta, "content", None), "content")
+                if delta and content_text:
+                    content_parts.append(content_text)
                     if not tool_calls_acc:
                         _fire_first_delta()
-                        self._fire_stream_delta(delta.content)
+                        self._fire_stream_delta(content_text)
                         deltas_were_sent["yes"] = True
                     else:
                         # Tool calls suppress regular content streaming (avoids
@@ -6809,8 +6833,8 @@ class AIAgent:
                         # box is already closed (tool boundary flush).
                         if self.stream_delta_callback:
                             try:
-                                self.stream_delta_callback(delta.content)
-                                self._record_streamed_assistant_text(delta.content)
+                                self.stream_delta_callback(content_text)
+                                self._record_streamed_assistant_text(content_text)
                             except Exception:
                                 pass
 
