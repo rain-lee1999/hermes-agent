@@ -26,7 +26,17 @@ def test_check_for_updates_uses_cache(tmp_path, monkeypatch):
     (repo_dir / ".git").mkdir()
 
     cache_file = tmp_path / ".update_check"
-    cache_file.write_text(json.dumps({"ts": time.time(), "behind": 3}))
+    cache_file.write_text(
+        json.dumps(
+            {
+                "ts": time.time(),
+                "behind": 3,
+                "rev": None,
+                "repo_dir": str(repo_dir),
+                "source_repo": None,
+            }
+        )
+    )
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     with patch("hermes_cli.banner.subprocess.run") as mock_run:
@@ -58,6 +68,34 @@ def test_check_for_updates_expired_cache(tmp_path, monkeypatch):
     assert mock_run.call_count == 2  # git fetch + git rev-list
 
 
+def test_check_for_updates_prefers_local_source_checkout(tmp_path, monkeypatch):
+    """When a local source checkout exists, banner checks against that path."""
+    import hermes_cli.banner as banner
+
+    repo_dir = tmp_path / "hermes-agent"
+    repo_dir.mkdir()
+    (repo_dir / ".git").mkdir()
+
+    source_repo = tmp_path / "hermes-agent-source"
+    source_repo.mkdir()
+    (source_repo / ".git").mkdir()
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    with patch("hermes_cli.banner.resolve_local_update_source_repo", return_value=source_repo), \
+         patch("hermes_cli.banner.subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout="5\n")
+        result = banner.check_for_updates()
+
+    assert result == 5
+    assert mock_run.call_args_list[0].args[0] == [
+        "git",
+        "fetch",
+        "--quiet",
+        str(source_repo),
+        "main",
+    ]
+
+
 def test_check_for_updates_no_git_dir(tmp_path, monkeypatch):
     """Returns None when .git directory doesn't exist anywhere."""
     import hermes_cli.banner as banner
@@ -76,7 +114,7 @@ def test_check_for_updates_no_git_dir(tmp_path, monkeypatch):
 
 
 def test_check_for_updates_fallback_to_project_root(tmp_path, monkeypatch):
-    """Dev install: falls back to Path(__file__).parent.parent when HERMES_HOME has no git repo."""
+    """Dev install: falls back to Path(__file__).parent.parent when no local source checkout exists."""
     import hermes_cli.banner as banner
 
     project_root = Path(banner.__file__).parent.parent.resolve()
@@ -85,7 +123,8 @@ def test_check_for_updates_fallback_to_project_root(tmp_path, monkeypatch):
 
     # Point HERMES_HOME at a temp dir with no hermes-agent/.git
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    with patch("hermes_cli.banner.subprocess.run") as mock_run:
+    with patch("hermes_cli.banner.resolve_local_update_source_repo", return_value=None), \
+         patch("hermes_cli.banner.subprocess.run") as mock_run:
         mock_run.return_value = MagicMock(returncode=0, stdout="0\n")
         result = banner.check_for_updates()
     # Should have fallen back to project root and run git commands

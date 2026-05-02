@@ -1,9 +1,8 @@
-"""Tests for `hermes update --yes / -y` — assume yes for interactive prompts.
+"""Tests for `hermes update --yes / -y`.
 
 Covers:
   1. argparse parses the flag
-  2. Config-migration prompt is auto-answered (no input() call) and migrate_config
-     runs with interactive=False so API-key prompts are skipped
+  2. Update no longer mutates config/.env during the main code-update flow
   3. Autostash restore prompt is auto-answered (prompt_for_restore == False, no
      input() call) and the stash is applied automatically
 """
@@ -47,82 +46,66 @@ def _make_run_side_effect(
     return side_effect
 
 
-class TestUpdateYesConfigMigration:
-    """--yes auto-answers the config-migration prompt and skips API-key prompts."""
+class TestUpdateConfigMigrationRemovedFromMainFlow:
+    """`hermes update` no longer mutates config/.env during code update."""
 
-    @patch("hermes_cli.config.migrate_config")
     @patch("hermes_cli.config.check_config_version", return_value=(1, 2))
     @patch("hermes_cli.config.get_missing_config_fields", return_value=[])
     @patch("hermes_cli.config.get_missing_env_vars", return_value=["NEW_KEY"])
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
-    def test_yes_auto_migrates_without_input(
+    def test_yes_does_not_auto_migrate_config(
         self,
         mock_run,
         _mock_which,
         _mock_missing_env,
         _mock_missing_cfg,
         _mock_version,
-        mock_migrate,
         capsys,
     ):
         mock_run.side_effect = _make_run_side_effect(
             branch="main", verify_ok=True, commit_count="1"
         )
-        mock_migrate.return_value = {"env_added": [], "config_added": []}
 
         args = SimpleNamespace(yes=True)
 
         with patch("builtins.input") as mock_input:
             cmd_update(args)
-            # Never prompted the user.
+            # Update no longer prompts for config migration.
             mock_input.assert_not_called()
 
-        # migrate_config was invoked with interactive=False — API-key prompts
-        # are suppressed, matching gateway-mode semantics.
-        assert mock_migrate.call_count == 1
-        _, kwargs = mock_migrate.call_args
-        assert kwargs.get("interactive") is False
-
         out = capsys.readouterr().out
-        assert "--yes: auto-applying config migration" in out
-        # The "Would you like to configure them now?" prompt text never appears.
+        assert "Run 'hermes config migrate' later if you want to apply them." in out
+        assert "--yes: auto-applying config migration" not in out
         assert "Would you like to configure them now?" not in out
 
-    @patch("hermes_cli.config.migrate_config")
     @patch("hermes_cli.config.check_config_version", return_value=(1, 2))
     @patch("hermes_cli.config.get_missing_config_fields", return_value=[])
     @patch("hermes_cli.config.get_missing_env_vars", return_value=["NEW_KEY"])
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
-    def test_no_yes_flag_still_prompts_in_tty(
+    def test_without_yes_still_does_not_prompt_for_config_migration(
         self,
         mock_run,
         _mock_which,
         _mock_missing_env,
         _mock_missing_cfg,
         _mock_version,
-        mock_migrate,
         capsys,
     ):
-        """Regression guard: without --yes, the TTY prompt path still fires."""
+        """Regression guard: config migration is reported, not interactive."""
         mock_run.side_effect = _make_run_side_effect(
             branch="main", verify_ok=True, commit_count="1"
         )
-        mock_migrate.return_value = {"env_added": [], "config_added": []}
 
         args = SimpleNamespace(yes=False)
 
-        with patch("builtins.input", return_value="n") as mock_input, patch(
-            "hermes_cli.main.sys"
-        ) as mock_sys:
-            mock_sys.stdin.isatty.return_value = True
-            mock_sys.stdout.isatty.return_value = True
+        with patch("builtins.input") as mock_input:
             cmd_update(args)
-            # The user was actually prompted.
-            assert mock_input.called
-            prompts = [c.args[0] if c.args else "" for c in mock_input.call_args_list]
-            assert any("configure them now" in p for p in prompts)
+            mock_input.assert_not_called()
+
+        out = capsys.readouterr().out
+        assert "Run 'hermes config migrate' later if you want to apply them." in out
 
 
 class TestUpdateYesStashRestore:

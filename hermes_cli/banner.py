@@ -12,6 +12,7 @@ import threading
 import time
 from pathlib import Path
 from hermes_constants import get_hermes_home
+from hermes_cli.update_source import resolve_local_update_source_repo
 from typing import Dict, List, Optional
 
 from rich.console import Console
@@ -151,20 +152,33 @@ def _check_via_rev(local_rev: str) -> Optional[int]:
     return 0 if upstream_rev == local_rev else UPDATE_AVAILABLE_NO_COUNT
 
 
-def _check_via_local_git(repo_dir: Path) -> Optional[int]:
-    """Count commits behind origin/main in a local checkout."""
+def _check_via_local_git(
+    repo_dir: Path,
+    source_repo: Optional[Path] = None,
+) -> Optional[int]:
+    """Count commits behind the active update source in a local checkout."""
+    compare_ref = "origin/main"
+    fetch_args = ["git", "fetch", "origin", "--quiet"]
+    if source_repo is not None:
+        fetch_args = ["git", "fetch", "--quiet", str(source_repo), "main"]
+        compare_ref = "FETCH_HEAD"
+
     try:
-        subprocess.run(
-            ["git", "fetch", "origin", "--quiet"],
-            capture_output=True, timeout=10,
+        fetch_result = subprocess.run(
+            fetch_args,
+            capture_output=True,
+            timeout=10,
             cwd=str(repo_dir),
         )
+        if fetch_result.returncode != 0 and source_repo is not None:
+            return None
     except Exception:
-        pass  # Offline or timeout — use stale refs, that's fine
+        if source_repo is not None:
+            return None
 
     try:
         result = subprocess.run(
-            ["git", "rev-list", "--count", "HEAD..origin/main"],
+            ["git", "rev-list", "--count", f"HEAD..{compare_ref}"],
             capture_output=True, text=True, timeout=5,
             cwd=str(repo_dir),
         )
@@ -180,7 +194,11 @@ def check_for_updates() -> Optional[int]:
 
     Two paths: if ``HERMES_REVISION`` is set (nix builds embed it), compare
     it to upstream main via ``git ls-remote``. Otherwise look for a local
-    git checkout and count commits behind ``origin/main``.
+    git checkout and count commits behind the best available update source.
+
+    When a sibling source checkout is available, ``hermes update`` prefers
+    that checkout over GitHub so developers can keep a local ``main`` tree as
+    the canonical source.
 
     Returns the number of commits behind, ``UPDATE_AVAILABLE_NO_COUNT`` (-1)
     if behind but the count is unknown, ``0`` if up-to-date, or ``None`` if
@@ -190,7 +208,18 @@ def check_for_updates() -> Optional[int]:
     cache_file = hermes_home / ".update_check"
     embedded_rev = os.environ.get("HERMES_REVISION") or None
 
-    # Read cache — invalidate if the embedded rev has changed since last check
+    repo_dir = hermes_home / "hermes-agent"
+    if not (repo_dir / ".git").exists():
+        repo_dir = Path(__file__).parent.parent.resolve()
+    if not (repo_dir / ".git").exists():
+        return None
+
+    source_repo = None if embedded_rev else resolve_local_update_source_repo(repo_dir)
+    cache_source = str(source_repo) if source_repo is not None else None
+    cache_repo = str(repo_dir)
+
+    # Read cache — invalidate if the embedded rev, repo, or update source has
+    # changed since the last check.
     now = time.time()
     try:
         if cache_file.exists():
@@ -198,6 +227,8 @@ def check_for_updates() -> Optional[int]:
             if (
                 now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS
                 and cached.get("rev") == embedded_rev
+                and cached.get("repo_dir") == cache_repo
+                and cached.get("source_repo") == cache_source
             ):
                 return cached.get("behind")
     except Exception:
@@ -206,15 +237,20 @@ def check_for_updates() -> Optional[int]:
     if embedded_rev:
         behind = _check_via_rev(embedded_rev)
     else:
-        repo_dir = hermes_home / "hermes-agent"
-        if not (repo_dir / ".git").exists():
-            repo_dir = Path(__file__).parent.parent.resolve()
-        if not (repo_dir / ".git").exists():
-            return None
-        behind = _check_via_local_git(repo_dir)
+        behind = _check_via_local_git(repo_dir, source_repo=source_repo)
 
     try:
-        cache_file.write_text(json.dumps({"ts": now, "behind": behind, "rev": embedded_rev}))
+        cache_file.write_text(
+            json.dumps(
+                {
+                    "ts": now,
+                    "behind": behind,
+                    "rev": embedded_rev,
+                    "repo_dir": cache_repo,
+                    "source_repo": cache_source,
+                }
+            )
+        )
     except Exception:
         pass
 
