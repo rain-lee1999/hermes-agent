@@ -7,6 +7,7 @@ from unittest.mock import patch
 import pytest
 
 from hermes_cli.main import cmd_update, PROJECT_ROOT
+import hermes_cli.main as hermes_main
 
 
 def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
@@ -45,8 +46,9 @@ class TestCmdUpdateBranchFallback:
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
     def test_update_falls_back_to_main_when_branch_not_on_remote(
-        self, mock_run, _mock_which, mock_args, capsys
+        self, mock_run, _mock_which, mock_args, monkeypatch, capsys
     ):
+        monkeypatch.setattr(hermes_main, "resolve_local_update_source_repo", lambda project_root: None)
         mock_run.side_effect = _make_run_side_effect(
             branch="fix/stoicneko", verify_ok=False, commit_count="3"
         )
@@ -69,8 +71,9 @@ class TestCmdUpdateBranchFallback:
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
     def test_update_uses_current_branch_when_on_remote(
-        self, mock_run, _mock_which, mock_args, capsys
+        self, mock_run, _mock_which, mock_args, monkeypatch, capsys
     ):
+        monkeypatch.setattr(hermes_main, "resolve_local_update_source_repo", lambda project_root: None)
         mock_run.side_effect = _make_run_side_effect(
             branch="main", verify_ok=True, commit_count="2"
         )
@@ -86,6 +89,41 @@ class TestCmdUpdateBranchFallback:
         pull_cmds = [c for c in commands if "pull" in c]
         assert len(pull_cmds) == 1
         assert "main" in pull_cmds[0]
+
+    @patch("shutil.which", return_value=None)
+    def test_update_prefers_local_source_checkout(self, _mock_which, mock_args, tmp_path, monkeypatch, capsys):
+        local_source = tmp_path / "hermes-agent-source"
+        local_source.mkdir()
+        (local_source / ".git").mkdir()
+
+        monkeypatch.setattr(hermes_main, "resolve_local_update_source_repo", lambda project_root: local_source)
+
+        recorded = []
+
+        def fake_run(cmd, **kwargs):
+            recorded.append(cmd)
+            if cmd == ["git", "fetch", "--quiet", str(local_source), "main"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout="main\n", stderr="")
+            if cmd == ["git", "rev-list", "HEAD..FETCH_HEAD", "--count"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout="1\n", stderr="")
+            if cmd == ["git", "pull", "--ff-only", str(local_source), "main"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout="Updating\n", stderr="")
+            if cmd == ["git", "status", "--porcelain"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+
+        cmd_update(mock_args)
+
+        commands = [" ".join(str(a) for a in cmd) for cmd in recorded]
+        assert any(str(local_source) in cmd for cmd in commands if "fetch" in cmd)
+        assert any(str(local_source) in cmd for cmd in commands if "pull" in cmd)
+        assert not any("origin" in cmd for cmd in commands if "fetch" in cmd)
+        out = capsys.readouterr().out
+        assert "local source checkout" in out
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
@@ -105,6 +143,80 @@ class TestCmdUpdateBranchFallback:
         commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
         pull_cmds = [c for c in commands if "pull" in c]
         assert len(pull_cmds) == 0
+
+    @patch("hermes_cli.profiles.seed_profile_skills")
+    @patch("hermes_cli.profiles.list_profiles", return_value=[])
+    @patch("hermes_cli.profiles.get_active_profile_name", return_value="default")
+    @patch("tools.skills_sync.sync_skills")
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_update_skills_sync_is_skipped_by_default(
+        self,
+        mock_run,
+        _mock_which,
+        mock_sync_skills,
+        _mock_active_profile,
+        _mock_list_profiles,
+        _mock_seed_profile_skills,
+        mock_args,
+        capsys,
+    ):
+        mock_run.side_effect = _make_run_side_effect(
+            branch="main", verify_ok=True, commit_count="1"
+        )
+        mock_sync_skills.return_value = {
+            "copied": [],
+            "updated": [],
+            "skipped": 0,
+            "user_modified": [],
+            "cleaned": [],
+            "total_bundled": 0,
+        }
+
+        cmd_update(mock_args)
+
+        mock_sync_skills.assert_not_called()
+        _mock_seed_profile_skills.assert_not_called()
+        out = capsys.readouterr().out
+        assert "Bundled skills sync skipped (use --sync-skills to enable)" in out
+
+    @patch("hermes_cli.profiles.seed_profile_skills")
+    @patch("hermes_cli.profiles.list_profiles", return_value=[])
+    @patch("hermes_cli.profiles.get_active_profile_name", return_value="default")
+    @patch("tools.skills_sync.sync_skills")
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_update_sync_skills_flag_runs_skill_sync(
+        self,
+        mock_run,
+        _mock_which,
+        mock_sync_skills,
+        _mock_active_profile,
+        _mock_list_profiles,
+        _mock_seed_profile_skills,
+        mock_args,
+        capsys,
+    ):
+        mock_run.side_effect = _make_run_side_effect(
+            branch="main", verify_ok=True, commit_count="1"
+        )
+        mock_sync_skills.return_value = {
+            "copied": ["alpha"],
+            "updated": [],
+            "skipped": 0,
+            "user_modified": [],
+            "cleaned": [],
+            "total_bundled": 1,
+        }
+
+        args = SimpleNamespace(sync_skills=True)
+        cmd_update(args)
+
+        mock_sync_skills.assert_called_once_with(quiet=True)
+        _mock_seed_profile_skills.assert_not_called()
+        out = capsys.readouterr().out
+        assert "Syncing bundled skills" in out
+        assert "alpha" in out
 
     @patch("shutil.which")
     @patch("subprocess.run")
@@ -143,8 +255,8 @@ class TestCmdUpdateBranchFallback:
             (["/usr/bin/npm", "run", "build"], PROJECT_ROOT / "web"),
         ]
 
-    def test_update_non_interactive_skips_migration_prompt(self, mock_args, capsys):
-        """When stdin/stdout aren't TTYs, config migration prompt is skipped."""
+    def test_update_non_interactive_reports_migration_available_but_skips_prompt(self, mock_args, capsys):
+        """When stdin/stdout aren't TTYs, update reports config drift without prompting."""
         with patch("shutil.which", return_value=None), patch(
             "subprocess.run"
         ) as mock_run, patch("builtins.input") as mock_input, patch(
@@ -162,4 +274,4 @@ class TestCmdUpdateBranchFallback:
 
             mock_input.assert_not_called()
             captured = capsys.readouterr()
-            assert "Non-interactive session" in captured.out
+            assert "Run 'hermes config migrate' later if you want to apply them." in captured.out

@@ -169,6 +169,7 @@ _apply_profile_override()
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
 from hermes_cli.config import get_hermes_home
+from hermes_cli.update_source import resolve_local_update_source_repo
 from hermes_cli.env_loader import load_hermes_dotenv
 
 load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
@@ -6428,6 +6429,41 @@ def _cmd_update_check():
     if sys.platform == "win32":
         git_cmd = ["git", "-c", "windows.appendAtomically=false"]
 
+    local_source_repo = resolve_local_update_source_repo(PROJECT_ROOT)
+    if local_source_repo is not None:
+        print(f"→ Fetching from local source checkout: {local_source_repo}...")
+        fetch_result = subprocess.run(
+            git_cmd + ["fetch", "--quiet", str(local_source_repo), "main"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        if fetch_result.returncode != 0:
+            stderr = fetch_result.stderr.strip()
+            print("✗ Failed to fetch from the local source checkout.")
+            if stderr:
+                print(f"  {stderr.splitlines()[0]}")
+            sys.exit(1)
+
+        rev_result = subprocess.run(
+            git_cmd + ["rev-list", "HEAD..FETCH_HEAD", "--count"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        behind = int(rev_result.stdout.strip())
+        if behind == 0:
+            print("✓ Already up to date.")
+        else:
+            commits_word = "commit" if behind == 1 else "commits"
+            print(
+                f"⚕ Update available: {behind} {commits_word} behind the local source checkout."
+            )
+            from hermes_cli.config import recommended_update_command
+            print(f"  Run '{recommended_update_command()}' to install.")
+        return
+
     print("→ Fetching from origin...")
     fetch_result = subprocess.run(
         git_cmd + ["fetch", "origin"],
@@ -6721,14 +6757,21 @@ def _cmd_update_impl(args, gateway_mode: bool):
     if sys.platform == "win32":
         git_cmd = ["git", "-c", "windows.appendAtomically=false"]
 
-    # Detect if we're updating from a fork (before any branch logic)
-    origin_url = _get_origin_url(git_cmd, PROJECT_ROOT)
-    is_fork = _is_fork(origin_url)
-
-    if is_fork:
-        print("⚠ Updating from fork:")
-        print(f"  {origin_url}")
+    local_source_repo = resolve_local_update_source_repo(PROJECT_ROOT)
+    is_fork = False
+    if local_source_repo is not None:
+        print("⚠ Updating from local source checkout:")
+        print(f"  {local_source_repo}")
         print()
+    else:
+        # Detect if we're updating from a fork (before any branch logic)
+        origin_url = _get_origin_url(git_cmd, PROJECT_ROOT)
+        is_fork = _is_fork(origin_url)
+
+        if is_fork:
+            print("⚠ Updating from fork:")
+            print(f"  {origin_url}")
+            print()
 
     if use_zip_update:
         # ZIP-based update for Windows when git is broken
@@ -6737,17 +6780,28 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
     # Fetch and pull
     try:
-
         print("→ Fetching updates...")
-        fetch_result = subprocess.run(
-            git_cmd + ["fetch", "origin"],
-            cwd=PROJECT_ROOT,
-            capture_output=True,
-            text=True,
-        )
+        if local_source_repo is not None:
+            fetch_result = subprocess.run(
+                git_cmd + ["fetch", "--quiet", str(local_source_repo), "main"],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+            )
+        else:
+            fetch_result = subprocess.run(
+                git_cmd + ["fetch", "origin"],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+            )
         if fetch_result.returncode != 0:
             stderr = fetch_result.stderr.strip()
-            if "Could not resolve host" in stderr or "unable to access" in stderr:
+            if local_source_repo is not None:
+                print("✗ Failed to fetch updates from the local source checkout.")
+                if stderr:
+                    print(f"  {stderr.splitlines()[0]}")
+            elif "Could not resolve host" in stderr or "unable to access" in stderr:
                 print("✗ Network error — cannot reach the remote repository.")
                 print(f"  {stderr.splitlines()[0]}" if stderr else "")
             elif (
@@ -6802,8 +6856,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
         )
 
         # Check if there are updates
+        compare_ref = "FETCH_HEAD" if local_source_repo is not None else f"origin/{branch}"
         result = subprocess.run(
-            git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
+            git_cmd + ["rev-list", f"HEAD..{compare_ref}", "--count"],
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
@@ -6854,33 +6909,60 @@ def _cmd_update_impl(args, gateway_mode: bool):
         print("→ Pulling updates...")
         update_succeeded = False
         try:
-            pull_result = subprocess.run(
-                git_cmd + ["pull", "--ff-only", "origin", branch],
-                cwd=PROJECT_ROOT,
-                capture_output=True,
-                text=True,
-            )
-            if pull_result.returncode != 0:
-                # ff-only failed — local and remote have diverged (e.g. upstream
-                # force-pushed or rebase).  Since local changes are already
-                # stashed, reset to match the remote exactly.
-                print(
-                    "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
-                )
-                reset_result = subprocess.run(
-                    git_cmd + ["reset", "--hard", f"origin/{branch}"],
+            if local_source_repo is not None:
+                pull_result = subprocess.run(
+                    git_cmd + ["pull", "--ff-only", str(local_source_repo), "main"],
                     cwd=PROJECT_ROOT,
                     capture_output=True,
                     text=True,
                 )
-                if reset_result.returncode != 0:
-                    print(f"✗ Failed to reset to origin/{branch}.")
-                    if reset_result.stderr.strip():
-                        print(f"  {reset_result.stderr.strip()}")
+            else:
+                pull_result = subprocess.run(
+                    git_cmd + ["pull", "--ff-only", "origin", branch],
+                    cwd=PROJECT_ROOT,
+                    capture_output=True,
+                    text=True,
+                )
+            if pull_result.returncode != 0:
+                # ff-only failed — local and remote have diverged (e.g. upstream
+                # force-pushed or rebase).  Since local changes are already
+                # stashed, reset to match the source exactly.
+                if local_source_repo is not None:
                     print(
-                        "  Try manually: git fetch origin && git reset --hard origin/main"
+                        "  ⚠ Fast-forward not possible (history diverged), resetting to match the local source..."
                     )
-                    sys.exit(1)
+                    reset_result = subprocess.run(
+                        git_cmd + ["reset", "--hard", "FETCH_HEAD"],
+                        cwd=PROJECT_ROOT,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if reset_result.returncode != 0:
+                        print("✗ Failed to reset to FETCH_HEAD.")
+                        if reset_result.stderr.strip():
+                            print(f"  {reset_result.stderr.strip()}")
+                        print(
+                            f"  Try manually: git fetch --quiet {local_source_repo} main && git reset --hard FETCH_HEAD"
+                        )
+                        sys.exit(1)
+                else:
+                    print(
+                        "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
+                    )
+                    reset_result = subprocess.run(
+                        git_cmd + ["reset", "--hard", f"origin/{branch}"],
+                        cwd=PROJECT_ROOT,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if reset_result.returncode != 0:
+                        print(f"✗ Failed to reset to origin/{branch}.")
+                        if reset_result.stderr.strip():
+                            print(f"  {reset_result.stderr.strip()}")
+                        print(
+                            "  Try manually: git fetch origin && git reset --hard origin/main"
+                        )
+                        sys.exit(1)
             update_succeeded = True
         finally:
             if auto_stash_ref is not None:
@@ -6912,7 +6994,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             )
 
         # Fork upstream sync logic (only for main branch on forks)
-        if is_fork and branch == "main":
+        if not local_source_repo and is_fork and branch == "main":
             _sync_with_upstream_if_needed(git_cmd, PROJECT_ROOT)
 
         # Reinstall Python dependencies. Prefer .[all], but if one optional extra
@@ -6964,63 +7046,71 @@ def _cmd_update_impl(args, gateway_mode: bool):
         except Exception:
             pass  # non-fatal — worst case a lazy import fails gracefully
 
-        # Sync bundled skills (copies new, updates changed, respects user deletions)
-        try:
-            from tools.skills_sync import sync_skills
+        sync_skills_requested = bool(getattr(args, "sync_skills", False))
+        if getattr(args, "no_sync_skills", False):
+            sync_skills_requested = False
 
-            print()
-            print("→ Syncing bundled skills...")
-            result = sync_skills(quiet=True)
-            if result["copied"]:
-                print(f"  + {len(result['copied'])} new: {', '.join(result['copied'])}")
-            if result.get("updated"):
-                print(
-                    f"  ↑ {len(result['updated'])} updated: {', '.join(result['updated'])}"
-                )
-            if result.get("user_modified"):
-                print(f"  ~ {len(result['user_modified'])} user-modified (kept)")
-            if result.get("cleaned"):
-                print(f"  − {len(result['cleaned'])} removed from manifest")
-            if not result["copied"] and not result.get("updated"):
-                print("  ✓ Skills are up to date")
-        except Exception as e:
-            logger.debug("Skills sync during update failed: %s", e)
+        if sync_skills_requested:
+            # Sync bundled skills (copies new, updates changed, respects user deletions)
+            try:
+                from tools.skills_sync import sync_skills
 
-        # Sync bundled skills to all other profiles
-        try:
-            from hermes_cli.profiles import (
-                list_profiles,
-                get_active_profile_name,
-                seed_profile_skills,
-            )
-
-            active = get_active_profile_name()
-            other_profiles = [p for p in list_profiles() if p.name != active]
-            if other_profiles:
                 print()
-                print("→ Syncing bundled skills to other profiles...")
-                for p in other_profiles:
-                    try:
-                        r = seed_profile_skills(p.path, quiet=True)
-                        if r:
-                            copied = len(r.get("copied", []))
-                            updated = len(r.get("updated", []))
-                            modified = len(r.get("user_modified", []))
-                            parts = []
-                            if copied:
-                                parts.append(f"+{copied} new")
-                            if updated:
-                                parts.append(f"↑{updated} updated")
-                            if modified:
-                                parts.append(f"~{modified} user-modified")
-                            status = ", ".join(parts) if parts else "up to date"
-                        else:
-                            status = "sync failed"
-                        print(f"  {p.name}: {status}")
-                    except Exception as pe:
-                        print(f"  {p.name}: error ({pe})")
-        except Exception:
-            pass  # profiles module not available or no profiles
+                print("→ Syncing bundled skills...")
+                result = sync_skills(quiet=True)
+                if result["copied"]:
+                    print(f"  + {len(result['copied'])} new: {', '.join(result['copied'])}")
+                if result.get("updated"):
+                    print(
+                        f"  ↑ {len(result['updated'])} updated: {', '.join(result['updated'])}"
+                    )
+                if result.get("user_modified"):
+                    print(f"  ~ {len(result['user_modified'])} user-modified (kept)")
+                if result.get("cleaned"):
+                    print(f"  − {len(result['cleaned'])} removed from manifest")
+                if not result["copied"] and not result.get("updated"):
+                    print("  ✓ Skills are up to date")
+            except Exception as e:
+                logger.debug("Skills sync during update failed: %s", e)
+
+            # Sync bundled skills to all other profiles
+            try:
+                from hermes_cli.profiles import (
+                    list_profiles,
+                    get_active_profile_name,
+                    seed_profile_skills,
+                )
+
+                active = get_active_profile_name()
+                other_profiles = [p for p in list_profiles() if p.name != active]
+                if other_profiles:
+                    print()
+                    print("→ Syncing bundled skills to other profiles...")
+                    for p in other_profiles:
+                        try:
+                            r = seed_profile_skills(p.path, quiet=True)
+                            if r:
+                                copied = len(r.get("copied", []))
+                                updated = len(r.get("updated", []))
+                                modified = len(r.get("user_modified", []))
+                                parts = []
+                                if copied:
+                                    parts.append(f"+{copied} new")
+                                if updated:
+                                    parts.append(f"↑{updated} updated")
+                                if modified:
+                                    parts.append(f"~{modified} user-modified")
+                                status = ", ".join(parts) if parts else "up to date"
+                            else:
+                                status = "sync failed"
+                            print(f"  {p.name}: {status}")
+                        except Exception as pe:
+                            print(f"  {p.name}: error ({pe})")
+            except Exception:
+                pass  # profiles module not available or no profiles
+        else:
+            print()
+            print("→ Bundled skills sync skipped (use --sync-skills to enable)")
 
         # Sync Honcho host blocks to all profiles
         try:
@@ -7032,7 +7122,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         except Exception:
             pass  # honcho plugin not installed or not configured
 
-        # Check for config migrations
+        # Report config drift without mutating user-managed files.
         print()
         print("→ Checking configuration for new options...")
 
@@ -7040,69 +7130,23 @@ def _cmd_update_impl(args, gateway_mode: bool):
             get_missing_env_vars,
             get_missing_config_fields,
             check_config_version,
-            migrate_config,
         )
 
         missing_env = get_missing_env_vars(required_only=True)
         missing_config = get_missing_config_fields()
         current_ver, latest_ver = check_config_version()
 
-        needs_migration = missing_env or missing_config or current_ver < latest_ver
-
-        if needs_migration:
+        if missing_env or missing_config or current_ver < latest_ver:
             print()
+            if current_ver < latest_ver:
+                print(f"  ℹ Config version: {current_ver} → {latest_ver}")
             if missing_env:
                 print(
-                    f"  ⚠️  {len(missing_env)} new required setting(s) need configuration"
+                    f"  ⚠️  {len(missing_env)} new required setting(s) are available"
                 )
             if missing_config:
-                print(f"  ℹ️  {len(missing_config)} new config option(s) available")
-
-            print()
-            if assume_yes:
-                print("  ℹ --yes: auto-applying config migration (skipping API-key prompts).")
-                response = "y"
-            elif gateway_mode:
-                response = (
-                    _gateway_prompt(
-                        "Would you like to configure new options now? [Y/n]", "n"
-                    )
-                    .strip()
-                    .lower()
-                )
-            elif not (sys.stdin.isatty() and sys.stdout.isatty()):
-                print("  ℹ Non-interactive session — skipping config migration prompt.")
-                print(
-                    "    Run 'hermes config migrate' later to apply any new config/env options."
-                )
-                response = "n"
-            else:
-                try:
-                    response = (
-                        input("Would you like to configure them now? [Y/n]: ")
-                        .strip()
-                        .lower()
-                    )
-                except EOFError:
-                    response = "n"
-
-            if response in ("", "y", "yes"):
-                print()
-                # In gateway mode OR under --yes, run auto-migrations only (no
-                # input() prompts for API keys which would hang the detached
-                # process / defeat the point of --yes).
-                results = migrate_config(
-                    interactive=not (gateway_mode or assume_yes), quiet=False
-                )
-
-                if results["env_added"] or results["config_added"]:
-                    print()
-                    print("✓ Configuration updated!")
-                if (gateway_mode or assume_yes) and missing_env:
-                    print("  ℹ API keys require manual entry: hermes config migrate")
-            else:
-                print()
-                print("Skipped. Run 'hermes config migrate' later to configure.")
+                print(f"  ℹ️  {len(missing_config)} new config option(s) are available")
+            print("  Run 'hermes config migrate' later if you want to apply them.")
         else:
             print("  ✓ Configuration is up to date")
 
@@ -9905,11 +9949,23 @@ Examples:
         help="Force a pre-update backup for this run (off by default; overrides updates.pre_update_backup)",
     )
     update_parser.add_argument(
+        "--sync-skills",
+        action="store_true",
+        default=False,
+        help="Sync bundled skills after the code update (including other profiles)",
+    )
+    update_parser.add_argument(
+        "--no-sync-skills",
+        action="store_true",
+        default=False,
+        help="Skip bundled skill sync for this run",
+    )
+    update_parser.add_argument(
         "--yes",
         "-y",
         action="store_true",
         default=False,
-        help="Assume yes for interactive prompts (config migration, stash restore). API-key entry is skipped; run 'hermes config migrate' separately for those.",
+        help="Assume yes for interactive prompts (stash restore). API-key entry is skipped; run 'hermes config migrate' separately for those.",
     )
     update_parser.set_defaults(func=cmd_update)
 
