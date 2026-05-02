@@ -1,78 +1,72 @@
 ---
 branch: auth
-purpose: macOS 登录项安装 + Codex Menubar 账号顺序同步
+purpose: keep same-session account selection sticky across main and auxiliary routing
 read_first: README.md
 spec: null
 plan: null
 primary_files:
-  - setup-hermes.sh
-  - scripts/install_macos_login_items.sh
-  - scripts/macos-login-items.md
-  - scripts/install_codex_menubar_sync_watcher.py
-  - scripts/HermesCodexAccountSyncWatcher
-  - scripts/reorder_codex_by_menubar_quota.py
-  - tests/scripts/test_setup_hermes_launchagent_install.py
+  - cli.py
+  - run_agent.py
+  - hermes_cli/runtime_provider.py
+  - agent/auxiliary_client.py
+  - tests/cli/test_cli_provider_resolution.py
+  - tests/agent/test_auxiliary_main_first.py
+  - tests/agent/test_codex_cloudflare_headers.py
 ---
 
 # auth AI brief
 
 ## One-line summary
 
-This branch makes `./setup-hermes.sh` install and start the repo-owned macOS LaunchAgent that keeps Codex Menubar account order in sync with Hermes auth, using a Markdown manifest as the install source of truth.
+This branch fixes the bug where appending to the same session would keep reselecting the highest-priority account instead of preserving the already-bound session credential.
 
 ## Must-know concepts
 
-- `scripts/macos-login-items.md`: source of truth for macOS background items.
-- `Launchd Label`: stable machine identifier; `Item` is only display text.
-- `scripts/install_macos_login_items.sh`: thin helper invoked by setup; no-op off macOS.
-- `scripts/HermesCodexAccountSyncWatcher`: long-running watcher that keeps Menubar-derived order fresh.
-- `scripts/install_codex_menubar_sync_watcher.py`: LaunchAgent installer for the watcher.
-- `scripts/reorder_codex_by_menubar_quota.py`: one-shot reorder/sync logic.
+- Session-bound runtime credential: once a session has a usable credential, later turns should reuse it.
+- Main vs auxiliary routing: `cli.py` / `run_agent.py` handle the primary conversation, while `agent/auxiliary_client.py` handles compression, titles, and similar side calls.
+- Repo mirror vs installed runtime: changes were synchronized across `/Users/rain/hermes-agent` and `/Users/rain/dev/-github/hermes-agent-auth`, but `~/.hermes` remains a separate installed profile.
 
 ## Before vs after
 
 ### Before
 
-- `setup-hermes.sh` did not centrally manage macOS login-item installation.
-- LaunchAgent install/start logic was easier to miss or duplicate.
-- Menubar sync and setup bootstrap were not connected by one reliable install path.
+- CLI active-session handling was sticky only on the surface.
+- `openai-codex` auxiliary routing could still reload the pool and call `select()` again.
+- Same-session append could jump back to the top-ranked account.
 
 ### After
 
-- `setup-hermes.sh` delegates to a shared helper at the end of setup.
-- The helper parses `scripts/macos-login-items.md` and installs items in order.
-- The watcher is launched via `launchctl` and can be verified with `launchctl print gui/{uid}/com.hermes.codex-menubar-account-sync-watcher`.
+- Active sessions keep the bound pool credential.
+- `main_runtime` carries the current credential into auxiliary routing.
+- `resolve_provider_client("openai-codex", ...)` prefers explicit runtime credentials and does not force pool reselection.
 
 ## Invariants to preserve
 
-1. `setup-hermes.sh` stays a thin entry point; new macOS items go in the manifest/helper.
-2. `Launchd Label` remains the stable identifier used by tests and verification.
-3. Menubar order syncing should preserve the persisted ranking order; do not re-sort independently.
+1. Same session append must not reselect the top-ranked account unless there is a real failover.
+2. New sessions may still start from the normal priority order.
+3. Auxiliary tasks must inherit the same session credential semantics as the main turn.
 
 ## Where to look in code
 
-- `setup-hermes.sh` — final setup hook into the helper.
-- `scripts/install_macos_login_items.sh` — manifest parser and installer dispatcher.
-- `scripts/macos-login-items.md` — editable source of truth for login items.
-- `scripts/install_codex_menubar_sync_watcher.py` — LaunchAgent plist installer.
-- `scripts/HermesCodexAccountSyncWatcher` — long-running watcher entry point.
-- `scripts/reorder_codex_by_menubar_quota.py` — one-shot sync/reorder logic.
-- `tests/scripts/test_setup_hermes_launchagent_install.py` — setup + install regression coverage.
+- `cli.py` — session credential stickiness and runtime refresh flow.
+- `run_agent.py` — propagates live main runtime into auxiliary calls.
+- `hermes_cli/runtime_provider.py` — builds the runtime dict passed around the app.
+- `agent/auxiliary_client.py` — the main fix for openai-codex explicit runtime credentials.
+- `tests/cli/test_cli_provider_resolution.py` — regression for active-session stickiness.
+- `tests/agent/test_auxiliary_main_first.py` / `tests/agent/test_codex_cloudflare_headers.py` — auxiliary routing regressions.
 
 ## Fast mental model
 
-Think of this branch as “setup bootstraps the watcher, the watcher keeps Menubar-derived order fresh, and the auth layer consumes that order.” The launchd pieces make it survive process exits; the manifest makes the install path extensible.
+Think of the session as owning one runtime credential until it genuinely fails. The bug was that the auxiliary path treated every turn like a fresh lookup and silently picked the best-ranked account again.
 
 ## Verification
 
-- `git rev-parse --show-toplevel`: `/Users/rain/dev/-github/hermes-agent-auth`
-- `git branch --show-current`: `auth`
-- `git log --oneline --decorate --graph upstream/main..HEAD --max-count=20`: branch currently has one unique commit, `386a5c5c8`
-- `date +%F`: `2026-05-02`
-- Earlier code verification already reported passing for `bash -n setup-hermes.sh`, `python3 -m py_compile ...`, and targeted pytest on the setup/watcher/quota tests; not rerun during this docs pass.
+- `scripts/run_tests.sh tests/cli/test_cli_provider_resolution.py::test_active_session_keeps_bound_pool_credential_instead_of_reselecting_top -q`: pass
+- `scripts/run_tests.sh tests/agent/test_auxiliary_main_first.py::TestResolveAutoMainFirst tests/agent/test_codex_cloudflare_headers.py -q`: pass
+- Direct hermetic `python -m pytest` in the auth worktree using `/Users/rain/hermes-agent/venv`: pass
 
 ## Future work usually looks like
 
-- Add another macOS background item by appending a new `## Item:` section to `scripts/macos-login-items.md`.
-- Extend installer parsing/validation for another login-item type.
-- Tweak watcher/reorder behavior when Menubar snapshot format or auth-state handling changes.
+- Propagate sticky runtime credentials into any new auxiliary route.
+- Add regression tests whenever a new provider path might re-open pool reselection.
+- Keep distinguishing branch-local repo edits from installed-profile state under `~/.hermes`.

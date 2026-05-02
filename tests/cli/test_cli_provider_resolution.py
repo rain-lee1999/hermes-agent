@@ -200,6 +200,72 @@ def test_runtime_resolution_rebuilds_agent_on_routing_change(monkeypatch):
     assert shell.api_mode == "codex_responses"
 
 
+def test_active_session_keeps_bound_pool_credential_instead_of_reselecting_top(monkeypatch):
+    cli = _import_cli()
+    codex_base_url = "https://chatgpt.com/backend-api/codex"
+    runtime_calls = []
+
+    def _runtime_resolve(**kwargs):
+        runtime_calls.append(kwargs)
+        return {
+            "provider": "openai-codex",
+            "api_mode": "codex_responses",
+            "base_url": codex_base_url,
+            "api_key": "top-ranked-key",
+            "source": "pool:openai-codex",
+        }
+
+    class _StickyPool:
+        provider = "openai-codex"
+
+        def __init__(self):
+            self.entry = SimpleNamespace(
+                provider="openai-codex",
+                id="sticky-id",
+                label="sticky-account",
+                priority=1,
+                source="manual:codex-file:sticky",
+                access_token="sticky-key",
+                runtime_api_key="sticky-key",
+                base_url=codex_base_url,
+                runtime_base_url=codex_base_url,
+                last_status=None,
+            )
+
+        def current(self):
+            return self.entry
+
+        def has_credentials(self):
+            return True
+
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", _runtime_resolve)
+    monkeypatch.setattr("hermes_cli.runtime_provider.format_runtime_provider_error", lambda exc: str(exc))
+
+    shell = cli.HermesCLI(model="gpt-5.2-codex", provider="openai-codex", compact=True, max_turns=1)
+    sticky_pool = _StickyPool()
+    shell.provider = "openai-codex"
+    shell.api_mode = "codex_responses"
+    shell.base_url = codex_base_url
+    shell.api_key = "sticky-key"
+    shell._credential_pool = sticky_pool
+    shell.agent = SimpleNamespace(_credential_pool=sticky_pool)
+    shell._active_agent_route_signature = (
+        shell.model,
+        "openai-codex",
+        codex_base_url,
+        "codex_responses",
+        None,
+        (),
+    )
+
+    assert shell._ensure_runtime_credentials() is True
+
+    assert runtime_calls == []
+    assert shell.api_key == "sticky-key"
+    assert shell._credential_pool is sticky_pool
+    assert shell.agent is not None
+
+
 def test_cli_turn_routing_uses_primary_when_disabled(monkeypatch):
     cli = _import_cli()
     shell = cli.HermesCLI(model="gpt-5", compact=True, max_turns=1)
