@@ -51,6 +51,59 @@ def _attach_agent(
     return cli_obj
 
 
+def _make_cli_for_status_bar(session_id: str = "20260427_104017_29442c"):
+    cli = HermesCLI.__new__(HermesCLI)
+    cli.model = "openai/gpt-5.5"
+    cli.session_id = session_id
+    cli.session_start = datetime.now()
+    cli._prompt_start_time = None
+    cli._prompt_duration = 26 * 60 + 34
+    cli._status_bar_visible = True
+    cli._model_picker_state = None
+    cli.reasoning_config = {"enabled": True, "effort": "medium"}
+    cli.service_tier = None
+    cli._selected_runtime_credential = {
+        "label": "3980-pro-50%",
+        "account_id": "acct-3980",
+        "id": "cred-3980",
+    }
+    cli._credential_pool = None
+    cli._session_db = None
+    cli._pending_title = None
+    cli.agent = SimpleNamespace(
+        model="openai/gpt-5.5",
+        session_input_tokens=0,
+        session_output_tokens=0,
+        session_cache_read_tokens=0,
+        session_cache_write_tokens=0,
+        session_prompt_tokens=0,
+        session_completion_tokens=0,
+        session_total_tokens=0,
+        session_api_calls=0,
+        reasoning_config=cli.reasoning_config,
+        service_tier=None,
+        request_overrides={},
+        _credential_pool=None,
+        context_compressor=SimpleNamespace(
+            last_prompt_tokens=265_000,
+            context_length=272_000,
+            compression_count=0,
+        ),
+    )
+    return cli
+
+
+class _FakeCredentialPool:
+    def __init__(self, current):
+        self._current = current
+
+    def current(self):
+        return self._current
+
+    def peek(self):
+        return self._current
+
+
 class TestCLIStatusBar:
     def test_context_style_thresholds(self):
         cli_obj = _make_cli()
@@ -265,6 +318,144 @@ class TestCLIStatusBar:
         fragments = cli_obj._get_voice_status_fragments(width=50)
 
         assert fragments == [("class:voice-status-recording", " ● REC ")]
+
+
+def test_status_bar_text_includes_copyable_session_id_on_wide_terminal():
+    cli = _make_cli_for_status_bar()
+
+    text = cli._build_status_bar_text(width=160)
+
+    assert "20260427_104017_29442c" in text
+    assert text.endswith(" │ 20260427_104017_29442c │ 3980-pro-50% │ medium │ normal")
+
+
+def test_status_bar_text_includes_session_title_after_reasoning_on_wide_terminal():
+    cli = _make_cli_for_status_bar()
+    cli._pending_title = None
+    cli._session_db = SimpleNamespace(
+        get_session=lambda session_id: {
+            "id": session_id,
+            "title": "忽略大文件夹配置",
+        }
+    )
+
+    text = cli._build_status_bar_text(width=180)
+
+    assert text.endswith(" │ 20260427_104017_29442c │ 3980-pro-50% │ medium │ normal │ 忽略大文件夹配置")
+
+
+def test_status_bar_fragments_include_session_title_after_reasoning_on_wide_terminal(monkeypatch):
+    cli = _make_cli_for_status_bar()
+    cli._pending_title = None
+    cli._session_db = SimpleNamespace(
+        get_session=lambda session_id: {
+            "id": session_id,
+            "title": "忽略大文件夹配置",
+        }
+    )
+    monkeypatch.setattr(cli, "_get_tui_terminal_width", lambda: 180)
+
+    plain_text = "".join(text for _, text in cli._get_status_bar_fragments())
+
+    assert " │ 20260427_104017_29442c │ 3980-pro-50% │ medium │ normal │ 忽略大文件夹配置 " in plain_text
+
+
+def test_status_bar_fragments_include_copyable_session_id_on_wide_terminal(monkeypatch):
+    cli = _make_cli_for_status_bar()
+    monkeypatch.setattr(cli, "_get_tui_terminal_width", lambda: 160)
+
+    plain_text = "".join(text for _, text in cli._get_status_bar_fragments())
+
+    assert " │ 20260427_104017_29442c │ 3980-pro-50% │ medium │ normal " in plain_text
+
+
+def test_status_bar_text_includes_fast_mode_label_after_reasoning_without_account():
+    cli = _make_cli_for_status_bar(session_id="20260430_180557_4494cd")
+    cli._selected_runtime_credential = None
+    cli.reasoning_config = {"enabled": True, "effort": "xhigh"}
+    cli.service_tier = "priority"
+    cli.agent.reasoning_config = cli.reasoning_config
+    cli.agent.service_tier = "priority"
+    cli.agent.request_overrides = {"service_tier": "priority"}
+    cli._pending_title = None
+    cli._session_db = SimpleNamespace(
+        get_session=lambda session_id: {
+            "id": session_id,
+            "title": "Hermes Fast Mode 修复",
+        }
+    )
+
+    text = cli._build_status_bar_text(width=180)
+
+    assert text.endswith(" │ 20260430_180557_4494cd │ xhigh │ fast │ Hermes Fast Mode 修复")
+
+
+def test_status_bar_account_uses_live_current_pool_entry():
+    cli = _make_cli_for_status_bar()
+    cli._selected_runtime_credential = {"label": "stale-account", "account_id": "stale", "id": "stale"}
+    current = SimpleNamespace(label="rotated-account", account_id="acct-new", id="cred-new")
+    pool = _FakeCredentialPool(current)
+    cli._credential_pool = pool
+    cli.agent._credential_pool = pool
+
+    text = cli._build_status_bar_text(width=160)
+
+    assert text.endswith(" │ 20260427_104017_29442c │ rotated-account │ medium │ normal")
+
+
+def test_status_bar_account_label_refreshes_from_persisted_pool(monkeypatch):
+    cli = _make_cli_for_status_bar()
+    current = SimpleNamespace(
+        provider="openai-codex",
+        label="leo-plus-35%",
+        account_id="acct-leo",
+        id="cred-leo",
+    )
+    pool = _FakeCredentialPool(current)
+    cli._credential_pool = pool
+    cli.agent._credential_pool = pool
+
+    from hermes_cli import auth
+
+    monkeypatch.setattr(
+        auth,
+        "read_credential_pool",
+        lambda provider: [
+            {"id": "cred-leo", "account_id": "acct-leo", "label": "leo-plus-12%"}
+        ] if provider == "openai-codex" else [],
+    )
+
+    text = cli._build_status_bar_text(width=180)
+
+    assert "leo-plus-12%" in text
+    assert "leo-plus-35%" not in text
+
+
+def test_status_bar_selected_account_label_refreshes_from_persisted_pool(monkeypatch):
+    cli = _make_cli_for_status_bar()
+    cli.provider = "openai-codex"
+    cli._credential_pool = None
+    cli.agent._credential_pool = None
+    cli._selected_runtime_credential = {
+        "label": "leo-plus-35%",
+        "account_id": "acct-leo",
+        "id": "cred-leo",
+    }
+
+    from hermes_cli import auth
+
+    monkeypatch.setattr(
+        auth,
+        "read_credential_pool",
+        lambda provider: [
+            {"id": "cred-leo", "account_id": "acct-leo", "label": "leo-plus-12%"}
+        ] if provider == "openai-codex" else [],
+    )
+
+    text = cli._build_status_bar_text(width=180)
+
+    assert "leo-plus-12%" in text
+    assert "leo-plus-35%" not in text
 
 
 class TestCLIUsageReport:

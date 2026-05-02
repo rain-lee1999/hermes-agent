@@ -2392,6 +2392,177 @@ class HermesCLI:
         emoji = "⏱" if live else "⏲"
         return f"{emoji} {time_str}"
 
+    def _status_bar_compact_label(self, value: Any, max_width: int = 28) -> str:
+        label = " ".join(str(value or "").split())
+        if not label or label.lower() in {"none", "null"}:
+            return ""
+        if self._status_bar_display_width(label) <= max_width:
+            return label
+        return self._trim_status_bar_text(label, max_width)
+
+    def _status_bar_credential_value(self, credential: Any, key: str) -> Any:
+        if credential is None:
+            return None
+        if isinstance(credential, dict):
+            return credential.get(key)
+        return getattr(credential, key, None)
+
+    def _status_bar_credential_values(self, credential: Any) -> tuple[Any, ...]:
+        return (
+            self._status_bar_credential_value(credential, "label"),
+            self._status_bar_credential_value(credential, "account_id"),
+            self._status_bar_credential_value(credential, "id"),
+            self._status_bar_credential_value(credential, "imported_from"),
+        )
+
+    def _status_bar_live_persisted_credential_label(self, credential: Any, provider: Any = None) -> str:
+        """Return the latest persisted credential label for the status bar.
+
+        Codex account sync/watchers can rewrite auth.json labels while a CLI
+        session is already running (for example leo-plus-35% -> leo-plus-12%).
+        The in-memory PooledCredential remains otherwise valid, but its label is
+        now stale.  Resolve the display label from the persisted pool on each
+        status snapshot, keyed by stable credential identity, and fall back to
+        the in-memory object if the persisted row is unavailable.
+        """
+        if credential is None:
+            return ""
+        resolved_provider = (
+            provider
+            or self._status_bar_credential_value(credential, "provider")
+            or getattr(self, "provider", None)
+        )
+        resolved_provider = str(resolved_provider or "").strip().lower()
+        if not resolved_provider:
+            return ""
+        credential_id = str(self._status_bar_credential_value(credential, "id") or "").strip()
+        account_id = str(self._status_bar_credential_value(credential, "account_id") or "").strip()
+        if not credential_id and not account_id:
+            return ""
+        try:
+            from hermes_cli.auth import read_credential_pool
+            persisted_entries = read_credential_pool(resolved_provider)
+        except Exception:
+            return ""
+        if not isinstance(persisted_entries, list):
+            return ""
+        for persisted in persisted_entries:
+            if not isinstance(persisted, dict):
+                continue
+            persisted_id = str(persisted.get("id") or "").strip()
+            persisted_account = str(persisted.get("account_id") or "").strip()
+            if (credential_id and persisted_id == credential_id) or (account_id and persisted_account == account_id):
+                for value in (
+                    persisted.get("label"),
+                    persisted.get("account_id"),
+                    persisted.get("id"),
+                    persisted.get("imported_from"),
+                ):
+                    label = self._status_bar_compact_label(value)
+                    if label:
+                        return label
+        return ""
+
+    def _status_bar_credential_label(self, credential: Any, provider: Any = None) -> str:
+        live_label = self._status_bar_live_persisted_credential_label(credential, provider=provider)
+        if live_label:
+            return live_label
+        for value in self._status_bar_credential_values(credential):
+            label = self._status_bar_compact_label(value)
+            if label:
+                return label
+        return ""
+
+    def _status_bar_current_account_label(self, agent: Any = None) -> str:
+        pools = []
+        seen = set()
+        for owner in (agent, self):
+            pool = getattr(owner, "_credential_pool", None) if owner is not None else None
+            if pool is not None and id(pool) not in seen:
+                pools.append(pool)
+                seen.add(id(pool))
+        for pool in pools:
+            entry = None
+            for method_name in ("current", "peek"):
+                method = getattr(pool, method_name, None)
+                if not callable(method):
+                    continue
+                try:
+                    entry = method()
+                except Exception:
+                    entry = None
+                if entry is not None:
+                    break
+            label = self._status_bar_credential_label(entry, provider=getattr(pool, "provider", None))
+            if label:
+                return label
+        selected = getattr(self, "_selected_runtime_credential", None)
+        return self._status_bar_credential_label(selected)
+
+    def _status_bar_reasoning_label(self, agent: Any = None) -> str:
+        sentinel = object()
+        config = getattr(agent, "reasoning_config", sentinel) if agent is not None else sentinel
+        if config is sentinel or config is None:
+            config = getattr(self, "reasoning_config", None)
+        if isinstance(config, dict):
+            if config.get("enabled") is False:
+                return "none"
+            effort = config.get("effort")
+            if effort:
+                return self._status_bar_compact_label(str(effort).lower(), max_width=12)
+            if config:
+                return "custom"
+        elif isinstance(config, str) and config.strip():
+            return self._status_bar_compact_label(config.strip().lower(), max_width=12)
+        return "medium"
+
+    def _status_bar_fast_mode_label(self, agent: Any = None, model_name: Any = None) -> str:
+        """Return the effective fast-mode status for the status bar.
+
+        Prefer actual request overrides on the live agent.  Fall back to the
+        configured service-tier only when the current model is known to support
+        Hermes fast mode; this avoids showing ``fast`` for a parsed config value
+        that cannot inject provider request overrides.
+        """
+        request_overrides = getattr(agent, "request_overrides", None) if agent is not None else None
+        if isinstance(request_overrides, dict):
+            service_tier = str(request_overrides.get("service_tier") or "").strip().lower()
+            speed = str(request_overrides.get("speed") or "").strip().lower()
+            if service_tier == "priority" or speed == "fast":
+                return "fast"
+
+        sentinel = object()
+        configured_tier = getattr(agent, "service_tier", sentinel) if agent is not None else sentinel
+        if configured_tier is sentinel or configured_tier is None:
+            configured_tier = getattr(self, "service_tier", None)
+        if _parse_service_tier_config(configured_tier) != "priority":
+            return "normal"
+
+        current_model = model_name or getattr(agent, "model", None) or getattr(self, "model", None)
+        try:
+            from hermes_cli.models import model_supports_fast_mode
+            if model_supports_fast_mode(current_model):
+                return "fast"
+        except Exception:
+            pass
+        return "normal"
+
+    def _status_bar_session_title_label(self) -> str:
+        title = getattr(self, "_pending_title", None) or ""
+        if not title:
+            session_id = getattr(self, "session_id", "") or ""
+            session_db = getattr(self, "_session_db", None)
+            if session_id and session_db is not None:
+                try:
+                    session = session_db.get_session(session_id) or {}
+                    if isinstance(session, dict):
+                        title = session.get("title") or ""
+                    else:
+                        title = getattr(session, "title", "") or ""
+                except Exception:
+                    title = ""
+        return self._status_bar_compact_label(title, max_width=40)
+
     def _get_status_bar_snapshot(self) -> Dict[str, Any]:
         # Prefer the agent's model name — it updates on fallback.
         # self.model reflects the originally configured model and never
@@ -2427,6 +2598,11 @@ class HermesCLI:
             "session_total_tokens": 0,
             "session_api_calls": 0,
             "compressions": 0,
+            "session_id": getattr(self, "session_id", "") or "",
+            "account_label": self._status_bar_current_account_label(agent),
+            "reasoning_label": self._status_bar_reasoning_label(agent),
+            "fast_mode_label": self._status_bar_fast_mode_label(agent, model_name=model_name),
+            "session_title": self._status_bar_session_title_label(),
         }
 
         if not agent:
@@ -2608,6 +2784,21 @@ class HermesCLI:
             prompt_elapsed = snapshot.get("prompt_elapsed")
             if prompt_elapsed:
                 parts.append(prompt_elapsed)
+            session_id = snapshot.get("session_id")
+            if session_id:
+                parts.append(session_id)
+                account_label = snapshot.get("account_label")
+                reasoning_label = snapshot.get("reasoning_label")
+                if account_label:
+                    parts.append(account_label)
+                if reasoning_label:
+                    parts.append(reasoning_label)
+                fast_mode_label = snapshot.get("fast_mode_label")
+                if fast_mode_label:
+                    parts.append(fast_mode_label)
+                session_title = snapshot.get("session_title")
+                if session_title:
+                    parts.append(session_title)
             return self._trim_status_bar_text(" │ ".join(parts), width)
         except Exception:
             return f"⚕ {self.model if getattr(self, 'model', None) else 'Hermes'}"
@@ -2672,6 +2863,26 @@ class HermesCLI:
                     if prompt_elapsed:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append(("class:status-bar-dim", prompt_elapsed))
+                    session_id = snapshot.get("session_id")
+                    if session_id:
+                        frags.append(("class:status-bar-dim", " │ "))
+                        frags.append(("class:status-bar-dim", session_id))
+                        account_label = snapshot.get("account_label")
+                        reasoning_label = snapshot.get("reasoning_label")
+                        if account_label:
+                            frags.append(("class:status-bar-dim", " │ "))
+                            frags.append(("class:status-bar-dim", account_label))
+                        if reasoning_label:
+                            frags.append(("class:status-bar-dim", " │ "))
+                            frags.append(("class:status-bar-dim", reasoning_label))
+                        fast_mode_label = snapshot.get("fast_mode_label")
+                        if fast_mode_label:
+                            frags.append(("class:status-bar-dim", " │ "))
+                            frags.append(("class:status-bar-dim", fast_mode_label))
+                        session_title = snapshot.get("session_title")
+                        if session_title:
+                            frags.append(("class:status-bar-dim", " │ "))
+                            frags.append(("class:status-bar-dim", session_title))
                     frags.append(("class:status-bar", " "))
 
             total_width = sum(self._status_bar_display_width(text) for _, text in frags)
@@ -3394,6 +3605,7 @@ class HermesCLI:
         self.acp_args = resolved_acp_args
         self._credential_pool = resolved_credential_pool
         self._provider_source = runtime.get("source")
+        self._selected_runtime_credential = runtime.get("selected_credential") if isinstance(runtime.get("selected_credential"), dict) else None
         self.api_key = api_key
         self.base_url = base_url
 
@@ -3438,6 +3650,8 @@ class HermesCLI:
         if (credentials_changed or routing_changed or model_changed) and self.agent is not None:
             self.agent = None
             self._active_agent_route_signature = None
+            self._provider_source = None
+            self._selected_runtime_credential = None
 
         return True
 
