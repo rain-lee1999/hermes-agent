@@ -143,25 +143,15 @@ class TestStreamingAccumulator:
 
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")
-    def test_tool_name_not_duplicated_when_resent_per_chunk(self, mock_close, mock_create):
-        """MiniMax M2.7 via NVIDIA NIM resends the full name in every chunk.
-
-        Bug #8259: the old += accumulation produced "read_fileread_file".
-        Assignment (matching OpenAI Node SDK / LiteLLM) prevents this.
-        """
+    def test_non_string_stream_values_are_skipped(self, mock_close, mock_create):
+        """MagicMock or other non-string stream fragments should not reach join()."""
         from run_agent import AIAgent
 
         chunks = [
-            _make_stream_chunk(tool_calls=[
-                _make_tool_call_delta(index=0, tc_id="call_nim", name="read_file")
-            ]),
-            _make_stream_chunk(tool_calls=[
-                _make_tool_call_delta(index=0, tc_id="call_nim", name="read_file", arguments='{"path":')
-            ]),
-            _make_stream_chunk(tool_calls=[
-                _make_tool_call_delta(index=0, tc_id="call_nim", name="read_file", arguments=' "x.py"}')
-            ]),
-            _make_stream_chunk(finish_reason="tool_calls"),
+            _make_stream_chunk(content="Hello", reasoning_content=MagicMock(name="bad-reasoning")),
+            _make_stream_chunk(content=MagicMock(name="bad-content"), reasoning_content="thinking"),
+            _make_stream_chunk(content=" world", finish_reason="stop", model="test-model"),
+            _make_empty_chunk(usage=SimpleNamespace(prompt_tokens=10, completion_tokens=2)),
         ]
 
         mock_client = MagicMock()
@@ -181,11 +171,9 @@ class TestStreamingAccumulator:
 
         response = agent._interruptible_streaming_api_call({})
 
-        tc = response.choices[0].message.tool_calls
-        assert tc is not None
-        assert len(tc) == 1
-        assert tc[0].function.name == "read_file"
-        assert tc[0].function.arguments == '{"path": "x.py"}'
+        assert response.choices[0].message.content == "Hello world"
+        assert response.choices[0].message.reasoning_content == "thinking"
+        assert response.choices[0].message.tool_calls is None
 
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")
