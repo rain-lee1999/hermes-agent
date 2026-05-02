@@ -29,6 +29,7 @@ import hashlib
 import json
 import logging
 logger = logging.getLogger(__name__)
+import math
 import os
 import random
 import re
@@ -1166,6 +1167,7 @@ class AIAgent:
         self._execution_thread_id: int | None = None  # Set at run_conversation() start
         self._interrupt_thread_signal_pending = False
         self._client_lock = threading.RLock()
+        self._non_stream_stale_timeout_count = 0
 
         # /steer mechanism — inject a user note into the next tool result
         # without interrupting the agent. Unlike interrupt(), steer() does
@@ -2527,6 +2529,44 @@ class AIAgent:
             except Exception:
                 logger.debug("status_callback error in _emit_status", exc_info=True)
 
+    def _transport_recovery_state_label(self, recovered: Optional[bool]) -> str:
+        if recovered is True:
+            return "transport_failure[recovered]"
+        if recovered is False:
+            return "transport_failure[recovery_failed]"
+        return "transport_failure[recovery_pending]"
+
+    def _is_visible_recoverable_transport_failure(self, classified: Any) -> bool:
+        reason = getattr(classified, "reason", None)
+        retryable = bool(getattr(classified, "retryable", False))
+        if not retryable:
+            return False
+        return reason in {
+            FailoverReason.timeout,
+            FailoverReason.server_error,
+            FailoverReason.rate_limit,
+        }
+
+    def _emit_visible_transport_failure_status(
+        self,
+        error: BaseException,
+        classified: Any,
+        *,
+        recovered: Optional[bool],
+    ) -> None:
+        """Emit machine-readable visible transport recovery status."""
+        label = self._transport_recovery_state_label(recovered)
+        reason = getattr(getattr(classified, "reason", None), "value", str(getattr(classified, "reason", "unknown")))
+        status_code = getattr(classified, "status_code", None)
+        model = getattr(self, "model", "") or "unknown"
+        provider = getattr(self, "provider", "") or "unknown"
+        detail = str(error).splitlines()[0][:180]
+        self._emit_status(
+            f"{label} visible_transport_auto_recovery "
+            f"reason={reason} provider={provider} model={model} "
+            f"status={status_code if status_code is not None else 'n/a'} detail={detail}"
+        )
+
     def _emit_warning(self, message: str) -> None:
         """Emit a user-visible warning through the same status plumbing.
 
@@ -2819,19 +2859,131 @@ class AIAgent:
 
         return 300.0, True
 
-    def _compute_non_stream_stale_timeout(self, messages: list[dict[str, Any]]) -> float:
+    def _context_bucket_for_estimated_tokens(self, estimated_tokens: int | None) -> str:
+        """Return a stable context bucket label for timeout policy."""
+        if estimated_tokens is None or estimated_tokens < 0:
+            return "unknown"
+        if estimated_tokens >= 100_000:
+            return "huge"
+        if estimated_tokens >= 50_000:
+            return "large"
+        if estimated_tokens >= 16_000:
+            return "medium"
+        return "small"
+
+    def _implicit_non_stream_stale_timeout_for_bucket(self, bucket: str) -> float:
+        """Implicit non-stream stale timeout policy; 300s is final fallback only."""
+        return {
+            "small": 90.0,
+            "medium": 120.0,
+            "large": 180.0,
+            "huge": 210.0,
+        }.get(bucket, 300.0)
+
+    def _non_stream_request_stats(self, api_payload: Any) -> dict[str, Any]:
+        """Build non-secret request metadata for stale-timeout policy."""
+        payload = api_payload if isinstance(api_payload, dict) else {"messages": api_payload or []}
+        pieces: list[Any] = []
+        for key in ("messages", "input", "instructions", "tools"):
+            if key in payload and payload.get(key) is not None:
+                pieces.append(payload.get(key))
+        if not pieces:
+            pieces.append(payload)
+
+        total_chars = 0
+        lowered_parts: list[str] = []
+        for piece in pieces:
+            try:
+                rendered = json.dumps(piece, ensure_ascii=False, sort_keys=True, default=str)
+            except Exception:
+                rendered = str(piece)
+            total_chars += len(rendered)
+            lowered_parts.append(rendered[:4096].lower())
+
+        estimated_tokens = total_chars // 4
+        bucket = self._context_bucket_for_estimated_tokens(estimated_tokens)
+        labels: list[str] = []
+        joined = "\n".join(lowered_parts)
+        label_terms = {
+            "spec": ("spec", "specification", "规格"),
+            "plan": ("plan", "implementation plan", "计划"),
+            "final": ("final", "final answer", "最终"),
+            "review": ("review", "code review", "审查"),
+            "architecture": ("architecture", "架构"),
+            "no-mvp": ("no-mvp", "no mvp", "禁止mvp", "禁止 mvp"),
+        }
+        for label, terms in label_terms.items():
+            if any(term in joined for term in terms):
+                labels.append(label)
+
+        return {
+            "estimated_context_tokens": estimated_tokens,
+            "context_bucket": bucket,
+            "long_output_request": bool(labels),
+            "long_output_indicators": labels,
+        }
+
+    def _parse_api_stale_timeout_hook_result(
+        self,
+        result: Any,
+        *,
+        legacy_timeout: float,
+    ) -> float | None:
+        """Parse one select_api_stale_timeout hook result fail-closed."""
+        raw = result
+        if isinstance(result, dict):
+            raw = result.get("stale_timeout_seconds")
+        try:
+            parsed = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(parsed) or parsed <= 0:
+            return None
+        return parsed
+
+    def _compute_non_stream_stale_timeout(self, api_payload: Any) -> float:
         """Compute the effective non-stream stale timeout for this request."""
         stale_base, uses_implicit_default = self._resolved_api_call_stale_timeout_base()
         base_url = getattr(self, "_base_url", None) or self.base_url or ""
         if uses_implicit_default and base_url and is_local_endpoint(base_url):
             return float("inf")
 
-        est_tokens = sum(len(str(v)) for v in messages) // 4
-        if est_tokens > 100_000:
-            return max(stale_base, 600.0)
-        if est_tokens > 50_000:
-            return max(stale_base, 450.0)
-        return stale_base
+        stats = self._non_stream_request_stats(api_payload)
+        if uses_implicit_default:
+            legacy_timeout = self._implicit_non_stream_stale_timeout_for_bucket(
+                stats.get("context_bucket", "unknown")
+            )
+        else:
+            legacy_timeout = stale_base
+
+        try:
+            from hermes_cli.plugins import invoke_hook
+
+            hook_results = invoke_hook(
+                "select_api_stale_timeout",
+                provider=getattr(self, "provider", "") or "",
+                model=getattr(self, "model", "") or "",
+                api_mode=getattr(self, "api_mode", "") or "",
+                legacy_timeout_seconds=legacy_timeout,
+                stale_timeout_seconds=legacy_timeout,
+                uses_implicit_default=uses_implicit_default,
+                context_bucket=stats.get("context_bucket", "unknown"),
+                estimated_context_tokens=stats.get("estimated_context_tokens"),
+                non_stream_stale_timeout_count=getattr(self, "_non_stream_stale_timeout_count", 0),
+                long_output_request=stats.get("long_output_request", False),
+                long_output_indicators=list(stats.get("long_output_indicators", [])),
+            )
+            for hook_result in hook_results:
+                parsed = self._parse_api_stale_timeout_hook_result(
+                    hook_result,
+                    legacy_timeout=legacy_timeout,
+                )
+                if parsed is not None:
+                    return parsed
+        except Exception:
+            logger.debug("select_api_stale_timeout hook failed; using legacy timeout", exc_info=True)
+
+        return legacy_timeout
 
     def _is_openrouter_url(self) -> bool:
         """Return True when the base URL targets OpenRouter."""
@@ -5771,7 +5923,13 @@ class AIAgent:
     def _close_request_openai_client(self, client: Any, *, reason: str) -> None:
         self._close_openai_client(client, reason=reason, shared=False)
 
-    def _run_codex_stream(self, api_kwargs: dict, client: Any = None, on_first_delta: callable = None):
+    def _run_codex_stream(
+        self,
+        api_kwargs: dict,
+        client: Any = None,
+        on_first_delta: callable = None,
+        on_stream_activity: callable = None,
+    ):
         """Execute one streaming Responses API request and return the final response."""
         import httpx as _httpx
 
@@ -5798,6 +5956,11 @@ class AIAgent:
                         if "output_text.delta" in event_type or event_type == "response.output_text.delta":
                             delta_text = getattr(event, "delta", "")
                             if delta_text:
+                                if on_stream_activity:
+                                    try:
+                                        on_stream_activity()
+                                    except Exception:
+                                        pass
                                 self._codex_streamed_text_parts.append(delta_text)
                             if delta_text and not has_tool_calls:
                                 if not first_delta_fired:
@@ -5815,6 +5978,11 @@ class AIAgent:
                         elif "reasoning" in event_type and "delta" in event_type:
                             reasoning_text = getattr(event, "delta", "")
                             if reasoning_text:
+                                if on_stream_activity:
+                                    try:
+                                        on_stream_activity()
+                                    except Exception:
+                                        pass
                                 self._fire_reasoning_delta(reasoning_text)
                         # Collect completed output items — some backends
                         # (chatgpt.com/backend-api/codex) stream valid items
@@ -5823,6 +5991,11 @@ class AIAgent:
                         elif event_type == "response.output_item.done":
                             done_item = getattr(event, "item", None)
                             if done_item is not None:
+                                if on_stream_activity:
+                                    try:
+                                        on_stream_activity()
+                                    except Exception:
+                                        pass
                                 collected_output_items.append(done_item)
                         # Log non-completed terminal events for diagnostics
                         elif event_type in ("response.incomplete", "response.failed"):
@@ -5893,10 +6066,19 @@ class AIAgent:
                         "Responses stream did not emit response.completed; falling back to create(stream=True). %s",
                         self._client_log_context(),
                     )
-                    return self._run_codex_create_stream_fallback(api_kwargs, client=active_client)
+                    return self._run_codex_create_stream_fallback(
+                        api_kwargs,
+                        client=active_client,
+                        on_stream_activity=on_stream_activity,
+                    )
                 raise
 
-    def _run_codex_create_stream_fallback(self, api_kwargs: dict, client: Any = None):
+    def _run_codex_create_stream_fallback(
+        self,
+        api_kwargs: dict,
+        client: Any = None,
+        on_stream_activity: callable = None,
+    ):
         """Fallback path for stream completion edge cases on Codex-style Responses backends."""
         active_client = client or self._ensure_primary_openai_client(reason="codex_create_stream_fallback")
         fallback_kwargs = dict(api_kwargs)
@@ -5926,12 +6108,22 @@ class AIAgent:
                     if done_item is None and isinstance(event, dict):
                         done_item = event.get("item")
                     if done_item is not None:
+                        if on_stream_activity:
+                            try:
+                                on_stream_activity()
+                            except Exception:
+                                pass
                         collected_output_items.append(done_item)
                 elif event_type in ("response.output_text.delta",):
                     delta = getattr(event, "delta", "")
                     if not delta and isinstance(event, dict):
                         delta = event.get("delta", "")
                     if delta:
+                        if on_stream_activity:
+                            try:
+                                on_stream_activity()
+                            except Exception:
+                                pass
                         collected_text_deltas.append(delta)
 
                 if event_type not in {"response.completed", "response.incomplete", "response.failed"}:
@@ -6310,6 +6502,10 @@ class AIAgent:
         """
         result = {"response": None, "error": None}
         request_client_holder = {"client": None}
+        provider_activity = {"last_ts": None}
+
+        def _mark_provider_activity():
+            provider_activity["last_ts"] = time.time()
 
         def _call():
             try:
@@ -6322,6 +6518,7 @@ class AIAgent:
                         api_kwargs,
                         client=request_client_holder["client"],
                         on_first_delta=getattr(self, "_codex_on_first_delta", None),
+                        on_stream_activity=_mark_provider_activity,
                     )
                 elif self.api_mode == "anthropic_messages":
                     result["response"] = self._anthropic_messages_create(api_kwargs)
@@ -6367,9 +6564,7 @@ class AIAgent:
         # httpx timeout (default 1800s) with zero feedback.  The stale
         # detector kills the connection early so the main retry loop can
         # apply richer recovery (credential rotation, provider fallback).
-        _stale_timeout = self._compute_non_stream_stale_timeout(
-            api_kwargs.get("messages", [])
-        )
+        _stale_timeout = self._compute_non_stream_stale_timeout(api_kwargs)
 
         _call_start = time.time()
         self._touch_activity("waiting for non-streaming API response")
@@ -6391,9 +6586,11 @@ class AIAgent:
 
             # Stale-call detector: kill the connection if no response
             # arrives within the configured timeout.
-            _elapsed = time.time() - _call_start
+            _activity_ts = provider_activity.get("last_ts") or _call_start
+            _elapsed = time.time() - _activity_ts
             if _elapsed > _stale_timeout:
-                _est_ctx = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
+                _stats = self._non_stream_request_stats(api_kwargs)
+                _est_ctx = _stats.get("estimated_context_tokens", 0)
                 logger.warning(
                     "Non-streaming API call stale for %.0fs (threshold %.0fs). "
                     "model=%s context=~%s tokens. Killing connection.",
@@ -6415,6 +6612,9 @@ class AIAgent:
                             self._close_request_openai_client(rc, reason="stale_call_kill")
                 except Exception:
                     pass
+                self._non_stream_stale_timeout_count = (
+                    getattr(self, "_non_stream_stale_timeout_count", 0) + 1
+                )
                 self._touch_activity(
                     f"stale non-streaming call killed after {int(_elapsed)}s"
                 )
@@ -6444,6 +6644,8 @@ class AIAgent:
                 raise InterruptedError("Agent interrupted during API call")
         if result["error"] is not None:
             raise result["error"]
+        if self.api_mode != "codex_responses":
+            self._non_stream_stale_timeout_count = 0
         return result["response"]
 
     # ── Unified streaming API call ─────────────────────────────────────────
@@ -11922,6 +12124,14 @@ class AIAgent:
                         classified.should_rotate_credential, classified.should_fallback,
                     )
 
+                    _visible_transport_recovery_pending = self._is_visible_recoverable_transport_failure(classified)
+                    if _visible_transport_recovery_pending:
+                        self._emit_visible_transport_failure_status(
+                            api_error,
+                            classified,
+                            recovered=None,
+                        )
+
                     recovered_with_pool, has_retried_429 = self._recover_with_credential_pool(
                         status_code=status_code,
                         has_retried_429=has_retried_429,
@@ -11929,6 +12139,12 @@ class AIAgent:
                         error_context=error_context,
                     )
                     if recovered_with_pool:
+                        if _visible_transport_recovery_pending:
+                            self._emit_visible_transport_failure_status(
+                                api_error,
+                                classified,
+                                recovered=True,
+                            )
                         continue
 
                     # Image-too-large recovery: shrink oversized native image
@@ -12632,16 +12848,34 @@ class AIAgent:
                             api_error, retry_count=retry_count, max_retries=max_retries,
                         ):
                             primary_recovery_attempted = True
+                            if _visible_transport_recovery_pending:
+                                self._emit_visible_transport_failure_status(
+                                    api_error,
+                                    classified,
+                                    recovered=True,
+                                )
                             retry_count = 0
                             continue
                         # Try fallback before giving up entirely
                         self._emit_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
                         if self._try_activate_fallback():
+                            if _visible_transport_recovery_pending:
+                                self._emit_visible_transport_failure_status(
+                                    api_error,
+                                    classified,
+                                    recovered=True,
+                                )
                             retry_count = 0
                             compression_attempts = 0
                             primary_recovery_attempted = False
                             continue
                         _final_summary = self._summarize_api_error(api_error)
+                        if _visible_transport_recovery_pending:
+                            self._emit_visible_transport_failure_status(
+                                api_error,
+                                classified,
+                                recovered=False,
+                            )
                         if is_rate_limited:
                             self._emit_status(f"❌ Rate limited after {max_retries} retries — {_final_summary}")
                         else:

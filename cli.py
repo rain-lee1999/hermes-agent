@@ -2252,6 +2252,7 @@ class HermesCLI:
         self._agent_running = False
         self._pending_input = queue.Queue()
         self._interrupt_queue = queue.Queue()
+        self._auto_recovery_probe_pending = False
         self._should_exit = False
         self._last_ctrl_c_time = 0
         self._clarify_state = None
@@ -2996,6 +2997,30 @@ class HermesCLI:
                 changed = True
 
         return changed
+
+    def _on_agent_status(self, event_type: str, message: str) -> None:
+        """Track machine-readable agent lifecycle status for CLI recovery."""
+        text = str(message or "")
+        if (
+            event_type == "lifecycle"
+            and "transport_failure[recovery_pending]" in text
+            and "visible_transport_auto_recovery" in text
+        ):
+            self._auto_recovery_probe_pending = True
+
+    def _queue_auto_recovery_probe_if_needed(self, pending_message: str | None) -> bool:
+        """Queue one `?` probe after visible recoverable transport failure."""
+        if pending_message:
+            self._auto_recovery_probe_pending = False
+            return False
+        if not getattr(self, "_auto_recovery_probe_pending", False):
+            return False
+        if not hasattr(self, "_pending_input"):
+            return False
+        self._auto_recovery_probe_pending = False
+        self._pending_input.put("?")
+        print("\n⚡ Queued recovery probe after recoverable transport failure: '?'")
+        return True
 
     def _on_thinking(self, text: str) -> None:
         """Called by agent when thinking starts/stops. Updates TUI spinner."""
@@ -3830,6 +3855,7 @@ class HermesCLI:
                 tool_complete_callback=self._on_tool_complete if self._inline_diffs_enabled else None,
                 stream_delta_callback=self._stream_delta if self.streaming_enabled else None,
                 tool_gen_callback=self._on_tool_gen_start if self.streaming_enabled else None,
+                status_callback=self._on_agent_status,
             )
             # Store reference for atexit memory provider shutdown
             global _active_agent_ref
@@ -9779,6 +9805,8 @@ class HermesCLI:
                 else:
                     print(f"\n⚡ Sending after interrupt: '{preview}'")
                 self._pending_input.put(combined)
+            else:
+                self._queue_auto_recovery_probe_if_needed(pending_message)
 
             # If a /steer was left over (agent finished before another tool
             # batch could absorb it), deliver it as the next user turn.
