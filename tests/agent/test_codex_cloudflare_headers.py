@@ -252,3 +252,26 @@ class TestAuxiliaryClientWiring:
             assert headers.get("originator") == "codex_cli_rs"
             assert headers.get("ChatGPT-Account-ID") == "acct-aux-raw-codex"
             assert headers.get("User-Agent", "").startswith("codex_cli_rs/")
+
+    def test_resolve_provider_client_openai_codex_uses_explicit_runtime_credential(self, monkeypatch):
+        """Sticky openai-codex runtime credentials should bypass pool reselection."""
+        from agent import auxiliary_client
+        token = _make_codex_jwt("acct-aux-explicit")
+        monkeypatch.setattr(
+            auxiliary_client, "_select_pool_entry",
+            lambda provider: (_ for _ in ()).throw(AssertionError("pool lookup should not run")),
+        )
+        with patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            mock_openai.return_value = MagicMock()
+            client, model = auxiliary_client.resolve_provider_client(
+                "openai-codex",
+                model="gpt-5.4",
+                explicit_api_key=token,
+                explicit_base_url="https://chatgpt.com/backend-api/codex/",
+            )
+            assert client is not None
+            headers = mock_openai.call_args.kwargs.get("default_headers") or {}
+            assert headers.get("originator") == "codex_cli_rs"
+            assert headers.get("ChatGPT-Account-ID") == "acct-aux-explicit"
+            assert headers.get("User-Agent", "").startswith("codex_cli_rs/")
+            assert str(mock_openai.call_args.kwargs["base_url"]).rstrip("/") == "https://chatgpt.com/backend-api/codex"

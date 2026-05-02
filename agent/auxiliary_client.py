@@ -1831,8 +1831,13 @@ def _resolve_auto(main_runtime: Optional[Dict[str, Any]] = None) -> Tuple[Option
         resolved_provider = main_provider
         explicit_base_url = None
         explicit_api_key = None
-        if runtime_base_url and (main_provider == "custom" or main_provider.startswith("custom:")):
-            resolved_provider = "custom"
+        if runtime_base_url and (
+            main_provider == "custom"
+            or main_provider.startswith("custom:")
+            or main_provider == "openai-codex"
+        ):
+            if main_provider == "custom" or main_provider.startswith("custom:"):
+                resolved_provider = "custom"
             explicit_base_url = runtime_base_url
             explicit_api_key = runtime_api_key or None
         client, resolved = resolve_provider_client(
@@ -2092,6 +2097,23 @@ def resolve_provider_client(
                 "or auxiliary.<task>.model for per-task aux routing)."
             )
             return None, None
+        final_model = _normalize_resolved_model(model, provider)
+        explicit_codex_token = (explicit_api_key or "").strip()
+        explicit_codex_base = (explicit_base_url or "").strip().rstrip("/")
+        if explicit_codex_token:
+            codex_base_url = _to_openai_base_url(explicit_codex_base) if explicit_codex_base else _CODEX_AUX_BASE_URL
+            logger.debug(
+                "resolve_provider_client: openai-codex using explicit runtime credential (%s)",
+                final_model,
+            )
+            raw_client = OpenAI(
+                api_key=explicit_codex_token,
+                base_url=codex_base_url,
+                default_headers=_codex_cloudflare_headers(explicit_codex_token),
+            )
+            client = CodexAuxiliaryClient(raw_client, final_model)
+            return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+                    else (client, final_model))
         if raw_codex:
             # Return the raw OpenAI client for callers that need direct
             # access to responses.stream() (e.g., the main agent loop).
@@ -2100,7 +2122,6 @@ def resolve_provider_client(
                 logger.warning("resolve_provider_client: openai-codex requested "
                                "but no Codex OAuth token found (run: hermes model)")
                 return None, None
-            final_model = _normalize_resolved_model(model, provider)
             raw_client = OpenAI(
                 api_key=codex_token,
                 base_url=_CODEX_AUX_BASE_URL,

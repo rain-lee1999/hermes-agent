@@ -162,6 +162,35 @@ class TestResolveAutoMainFirst:
         assert mock_resolve.call_args.args[0] == "anthropic"
         assert mock_resolve.call_args.args[1] == "runtime-model"
 
+    def test_openai_codex_runtime_override_forwards_explicit_credentials(self, monkeypatch):
+        """openai-codex main runtime should carry its sticky credential through to aux routing."""
+        with patch(
+            "agent.auxiliary_client._read_main_provider",
+            return_value="openrouter",
+        ), patch(
+            "agent.auxiliary_client._read_main_model",
+            return_value="config-model",
+        ), patch(
+            "agent.auxiliary_client.resolve_provider_client",
+        ) as mock_resolve:
+            mock_resolve.return_value = (MagicMock(), "gpt-5.4")
+
+            from agent.auxiliary_client import _resolve_auto
+
+            _resolve_auto(main_runtime={
+                "provider": "openai-codex",
+                "model": "gpt-5.4",
+                "base_url": "https://chatgpt.com/backend-api/codex",
+                "api_key": "sticky-key",
+                "api_mode": "codex_responses",
+            })
+
+        assert mock_resolve.call_args.args[0] == "openai-codex"
+        assert mock_resolve.call_args.args[1] == "gpt-5.4"
+        assert mock_resolve.call_args.kwargs["explicit_api_key"] == "sticky-key"
+        assert mock_resolve.call_args.kwargs["explicit_base_url"] == "https://chatgpt.com/backend-api/codex"
+        assert mock_resolve.call_args.kwargs["api_mode"] == "codex_responses"
+
 
 # ── Vision — resolve_vision_provider_client ─────────────────────────────────
 

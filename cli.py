@@ -3510,11 +3510,85 @@ class HermesCLI:
             _cprint(f"{_DIM}Failed to open external editor: {exc}{_RST}")
             return False
 
+    def _runtime_from_active_pool_credential(self) -> Optional[dict]:
+        """Return runtime config for the already-bound pool credential.
+
+        A CLI chat turn calls ``_ensure_runtime_credentials()`` before every
+        user message so env/key changes can be picked up.  For credential pools,
+        however, resolving from disk on every turn constructs a fresh pool and
+        ``select()`` picks priority-0 again.  That breaks the session-stickiness
+        contract: once a session has a usable pool entry, follow-up turns should
+        keep it until explicit session boundaries or real failover.
+        """
+        if getattr(self, "agent", None) is None:
+            return None
+        if getattr(self, "_explicit_api_key", None) or getattr(self, "_explicit_base_url", None):
+            return None
+
+        pool = getattr(self, "_credential_pool", None)
+        if pool is None:
+            pool = getattr(getattr(self, "agent", None), "_credential_pool", None)
+        if pool is None:
+            return None
+
+        current_fn = getattr(pool, "current", None)
+        if not callable(current_fn):
+            return None
+        try:
+            entry = current_fn()
+        except Exception as exc:
+            logger.debug("Could not read active credential pool current entry: %s", exc)
+            return None
+        if entry is None:
+            return None
+        if str(getattr(entry, "last_status", "") or "").strip().lower() == "exhausted":
+            return None
+
+        api_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
+        if not isinstance(api_key, str) or not api_key:
+            return None
+
+        pool_provider = str(
+            getattr(pool, "provider", "")
+            or getattr(entry, "provider", "")
+            or getattr(self, "provider", "")
+            or ""
+        ).strip().lower()
+        if not pool_provider:
+            return None
+
+        requested_provider = str(getattr(self, "requested_provider", "") or "").strip().lower()
+        current_provider = str(getattr(self, "provider", "") or "").strip().lower()
+        if requested_provider and requested_provider not in {"auto", pool_provider, current_provider}:
+            return None
+
+        runtime_provider = current_provider or pool_provider
+        if runtime_provider == "auto":
+            runtime_provider = pool_provider
+        if runtime_provider.startswith("custom:"):
+            runtime_provider = "custom"
+
+        try:
+            from hermes_cli.runtime_provider import _get_model_config, _resolve_runtime_from_pool_entry
+
+            return _resolve_runtime_from_pool_entry(
+                provider=runtime_provider,
+                entry=entry,
+                requested_provider=requested_provider or runtime_provider,
+                model_cfg=_get_model_config(),
+                pool=pool,
+                target_model=self.model,
+            )
+        except Exception as exc:
+            logger.debug("Could not build sticky runtime from active pool credential: %s", exc)
+            return None
+
     def _ensure_runtime_credentials(self) -> bool:
         """
         Ensure runtime credentials are resolved before agent use.
         Re-resolves provider credentials so key rotation and token refresh
-        are picked up without restarting the CLI.
+        are picked up without restarting the CLI, while preserving the already
+        bound credential pool entry inside an active session.
         Returns True if credentials are ready, False on auth failure.
         """
         from hermes_cli.runtime_provider import (
@@ -3523,13 +3597,14 @@ class HermesCLI:
         )
 
         _primary_exc = None
-        runtime = None
+        runtime = self._runtime_from_active_pool_credential()
         try:
-            runtime = resolve_runtime_provider(
-                requested=self.requested_provider,
-                explicit_api_key=self._explicit_api_key,
-                explicit_base_url=self._explicit_base_url,
-            )
+            if runtime is None:
+                runtime = resolve_runtime_provider(
+                    requested=self.requested_provider,
+                    explicit_api_key=self._explicit_api_key,
+                    explicit_base_url=self._explicit_base_url,
+                )
         except Exception as exc:
             _primary_exc = exc
 
