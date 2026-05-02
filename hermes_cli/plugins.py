@@ -192,7 +192,8 @@ class PluginManifest:
     path: Optional[str] = None
     # Plugin kind — see plugins.py module docstring for semantics.
     # ``standalone`` (default): hooks/tools of its own; opt-in via
-    #                           ``plugins.enabled``.
+    #                           ``plugins.enabled`` unless
+    #                           ``default_enabled`` is set.
     # ``backend``: pluggable backend for an existing core tool (e.g.
     #              image_gen). Built-in (bundled) backends auto-load;
     #              user-installed still gated by ``plugins.enabled``.
@@ -212,6 +213,9 @@ class PluginManifest:
     # category plugin at ``plugins/image_gen/openai/`` the key is
     # ``image_gen/openai``. When empty, falls back to ``name``.
     key: str = ""
+    # Load this plugin even when it is not listed in ``plugins.enabled``.
+    # Explicit ``plugins.disabled`` entries still win.
+    default_enabled: bool = False
 
 
 @dataclass
@@ -723,12 +727,16 @@ class PluginManager:
                 continue
 
             # Everything else (standalone, user-installed backends,
-            # entry-point plugins) is opt-in via plugins.enabled.
+            # entry-point plugins) is opt-in via plugins.enabled unless the
+            # manifest explicitly marks itself as default-enabled.
             # Accept both the path-derived key and the legacy bare name
             # so existing configs keep working.
             is_enabled = (
-                enabled is not None
-                and (lookup_key in enabled or manifest.name in enabled)
+                manifest.default_enabled
+                or (
+                    enabled is not None
+                    and (lookup_key in enabled or manifest.name in enabled)
+                )
             )
             if not is_enabled:
                 loaded = LoadedPlugin(manifest=manifest, enabled=False)
@@ -898,6 +906,7 @@ class PluginManager:
                 requires_env=data.get("requires_env", []),
                 provides_tools=data.get("provides_tools", []),
                 provides_hooks=data.get("provides_hooks", []),
+                default_enabled=bool(data.get("default_enabled", False)),
                 source=source,
                 path=str(plugin_dir),
                 kind=kind,
