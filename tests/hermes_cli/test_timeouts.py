@@ -306,3 +306,102 @@ def test_explicit_non_stream_stale_timeout_is_honored_for_local_endpoints(monkey
     )
 
     assert agent._compute_non_stream_stale_timeout([]) == 300.0
+
+
+def _make_timeout_agent(monkeypatch, tmp_path, *, provider="openai-codex", model="gpt-5.5", api_mode="codex_responses", base_url="https://api.openai.com/v1"):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    if not (tmp_path / "config.yaml").exists():
+        (tmp_path / "config.yaml").write_text("", encoding="utf-8")
+    from run_agent import AIAgent
+
+    agent = AIAgent.__new__(AIAgent)
+    agent.provider = provider
+    agent.model = model
+    agent.api_mode = api_mode
+    agent.base_url = base_url
+    agent._base_url = base_url
+    agent._base_url_lower = base_url.lower()
+    agent._base_url_hostname = "api.openai.com"
+    agent._non_stream_stale_timeout_count = 0
+    agent.log_prefix = ""
+    return agent
+
+
+def _messages_for_tokens(tokens: int) -> list[dict[str, str]]:
+    return [{"role": "user", "content": "x" * (tokens * 4)}]
+
+
+def test_select_api_stale_timeout_hook_is_registered():
+    from hermes_cli.plugins import VALID_HOOKS
+
+    assert "select_api_stale_timeout" in VALID_HOOKS
+
+
+def test_context_bucket_implicit_non_stream_stale_timeout(monkeypatch, tmp_path):
+    agent = _make_timeout_agent(monkeypatch, tmp_path)
+
+    assert agent._compute_non_stream_stale_timeout({"messages": _messages_for_tokens(1_000)}) == 90.0
+    assert agent._compute_non_stream_stale_timeout({"messages": _messages_for_tokens(20_000)}) == 120.0
+    assert agent._compute_non_stream_stale_timeout({"messages": _messages_for_tokens(60_000)}) == 180.0
+    assert agent._compute_non_stream_stale_timeout({"messages": _messages_for_tokens(120_000)}) == 210.0
+
+
+def test_explicit_non_stream_stale_timeout_wins_over_context_bucket(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_config(
+        tmp_path,
+        """\
+        providers:
+          openai-codex:
+            models:
+              gpt-5.5:
+                stale_timeout_seconds: 42
+        """,
+    )
+    agent = _make_timeout_agent(monkeypatch, tmp_path)
+
+    assert agent._compute_non_stream_stale_timeout({"messages": _messages_for_tokens(120_000)}) == 42.0
+
+
+def test_codex_responses_stale_timeout_context_uses_input_items(monkeypatch, tmp_path):
+    agent = _make_timeout_agent(monkeypatch, tmp_path)
+    stats = agent._non_stream_request_stats({
+        "input": [{"role": "user", "content": "write a plan\n" + ("x" * 240_000)}],
+        "instructions": "Return a complete spec and final plan.",
+        "tools": [{"name": "terminal", "description": "run commands"}],
+    })
+
+    assert stats["estimated_context_tokens"] >= 50_000
+    assert stats["context_bucket"] in {"large", "huge"}
+    assert stats["long_output_request"] is True
+    assert "plan" in stats["long_output_indicators"]
+    assert "final" in stats["long_output_indicators"]
+
+
+def test_select_api_stale_timeout_hook_dict_override(monkeypatch, tmp_path):
+    agent = _make_timeout_agent(monkeypatch, tmp_path)
+    seen = {}
+
+    def fake_invoke_hook(name, **kwargs):
+        seen.update(kwargs)
+        return [{"stale_timeout_seconds": 33, "reason": "unit-test"}]
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", fake_invoke_hook)
+
+    assert agent._compute_non_stream_stale_timeout({"messages": _messages_for_tokens(1_000)}) == 33.0
+    assert seen["context_bucket"] == "small"
+    assert seen["legacy_timeout_seconds"] == 90.0
+    assert seen["non_stream_stale_timeout_count"] == 0
+    assert "messages" not in seen
+    assert "input" not in seen
+
+
+def test_select_api_stale_timeout_hook_invalid_values_fall_back_to_legacy(monkeypatch, tmp_path):
+    agent = _make_timeout_agent(monkeypatch, tmp_path)
+
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_hook",
+        lambda name, **kwargs: [{"stale_timeout_seconds": -1}, object(), "bad"],
+    )
+
+    assert agent._compute_non_stream_stale_timeout({"messages": _messages_for_tokens(1_000)}) == 90.0
