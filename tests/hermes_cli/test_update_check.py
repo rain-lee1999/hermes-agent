@@ -39,7 +39,8 @@ def test_check_for_updates_uses_cache(tmp_path, monkeypatch):
     )
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    with patch("hermes_cli.banner.subprocess.run") as mock_run:
+    with patch("hermes_cli.banner.resolve_local_update_source_repo", return_value=None), \
+         patch("hermes_cli.banner.subprocess.run") as mock_run:
         result = check_for_updates()
 
     assert result == 3

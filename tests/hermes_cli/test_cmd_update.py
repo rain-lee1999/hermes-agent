@@ -218,11 +218,50 @@ class TestCmdUpdateBranchFallback:
         assert "Syncing bundled skills" in out
         assert "alpha" in out
 
+    @patch("hermes_cli.main._build_web_ui")
+    @patch("hermes_cli.main._update_node_dependencies")
+    @patch("hermes_cli.main._install_python_dependencies_with_optional_fallback")
+    @patch("hermes_cli.main._sync_with_upstream_if_needed")
+    @patch("hermes_cli.main._run_pre_update_backup")
+    @patch("hermes_cli.main._clear_bytecode_cache", return_value=0)
+    @patch("shutil.which", return_value="/usr/bin/uv")
+    @patch("subprocess.run")
+    def test_simple_update_skips_heavy_post_update_work(
+        self,
+        mock_run,
+        _mock_which,
+        _mock_clear_pyc,
+        mock_backup,
+        mock_upstream_sync,
+        mock_install_python,
+        mock_update_node,
+        mock_build_web,
+        monkeypatch,
+        capsys,
+    ):
+        monkeypatch.setattr(hermes_main, "resolve_local_update_source_repo", lambda project_root: None)
+        mock_run.side_effect = _make_run_side_effect(
+            branch="main", verify_ok=True, commit_count="1"
+        )
+
+        cmd_update(SimpleNamespace(simple=True))
+
+        mock_backup.assert_not_called()
+        mock_install_python.assert_not_called()
+        mock_update_node.assert_not_called()
+        mock_build_web.assert_not_called()
+        mock_upstream_sync.assert_not_called()
+        out = capsys.readouterr().out
+        assert "Code updated (simple mode)" in out
+        assert "dependency reinstall" in out
+
     @patch("shutil.which")
     @patch("subprocess.run")
     def test_update_refreshes_repo_and_tui_node_dependencies(
-        self, mock_run, mock_which, mock_args
+        self, mock_run, mock_which, mock_args, monkeypatch
     ):
+        monkeypatch.setattr(hermes_main, "resolve_local_update_source_repo", lambda project_root: None)
+        monkeypatch.setattr(hermes_main, "_web_ui_build_needed", lambda web_dir: True)
         mock_which.side_effect = {"uv": "/usr/bin/uv", "npm": "/usr/bin/npm"}.get
         mock_run.side_effect = _make_run_side_effect(
             branch="main", verify_ok=True, commit_count="1"
