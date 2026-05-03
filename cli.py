@@ -3009,18 +3009,15 @@ class HermesCLI:
             self._auto_recovery_probe_pending = True
 
     def _queue_auto_recovery_probe_if_needed(self, pending_message: str | None) -> bool:
-        """Queue one `?` probe after visible recoverable transport failure."""
+        """Clear stale transport-recovery state without inventing a user turn."""
         if pending_message:
             self._auto_recovery_probe_pending = False
             return False
         if not getattr(self, "_auto_recovery_probe_pending", False):
             return False
-        if not hasattr(self, "_pending_input"):
-            return False
         self._auto_recovery_probe_pending = False
-        self._pending_input.put("?")
-        print("\n⚡ Queued recovery probe after recoverable transport failure: '?'")
-        return True
+        print("\n⚡ Transport recovered; no automatic '?' was sent.")
+        return False
 
     def _on_thinking(self, text: str) -> None:
         """Called by agent when thinking starts/stops. Updates TUI spinner."""
