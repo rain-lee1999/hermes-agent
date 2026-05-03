@@ -411,6 +411,40 @@ def _select_highest_priority_pool_entry(provider: str) -> Tuple[bool, Optional[A
     return True, pool, entry
 
 
+def _find_matching_pool_entry(pool: Any, *, api_key: str = "", base_url: str = "") -> Optional[Any]:
+    """Find the available pool entry that backs an explicit runtime credential."""
+    if pool is None:
+        return None
+    runtime_key = str(api_key or "").strip()
+    runtime_base = str(base_url or "").strip().rstrip("/")
+    if not runtime_key and not runtime_base:
+        return None
+    try:
+        available = pool._available_entries(clear_expired=True, refresh=True)
+    except Exception as exc:
+        logger.debug("Auxiliary client: could not match runtime credential to pool entry: %s", exc)
+        return None
+    key_matches = []
+    for entry in available:
+        entry_key = _pool_runtime_api_key(entry)
+        if runtime_key and entry_key and entry_key == runtime_key:
+            key_matches.append(entry)
+    if len(key_matches) == 1:
+        return key_matches[0]
+    if len(key_matches) > 1:
+        for entry in key_matches:
+            entry_base = _pool_runtime_base_url(entry, "").strip().rstrip("/")
+            if runtime_base and entry_base == runtime_base:
+                return entry
+        return key_matches[0]
+    if runtime_base:
+        for entry in available:
+            entry_base = _pool_runtime_base_url(entry, "").strip().rstrip("/")
+            if entry_base and entry_base == runtime_base:
+                return entry
+    return None
+
+
 def _codex_live_pool_after_usage_limit(current_pool: Any, failed_entry: Any, error_context: Dict[str, Any]) -> Tuple[Any, Optional[Any]]:
     """Reload the live Codex pool and select the realtime highest-ranked entry.
 
@@ -3515,29 +3549,53 @@ def call_llm(
     if (
         task == "compression"
         and runtime_provider == "openai-codex"
-        and not runtime_base_url
-        and not runtime_api_key
         and resolved_provider in ("auto", "openai-codex", "", None)
     ):
-        pool_present, codex_pool, codex_pool_entry = _select_highest_priority_pool_entry("openai-codex")
-        if pool_present and codex_pool_entry is not None:
+        pool_present, codex_pool, highest_codex_entry = _select_highest_priority_pool_entry("openai-codex")
+        if pool_present and highest_codex_entry is not None:
+            sticky_entry = _find_matching_pool_entry(
+                codex_pool,
+                api_key=runtime_api_key,
+                base_url=runtime_base_url,
+            )
+            codex_pool_entry = sticky_entry or highest_codex_entry
+            five_hour_threshold, weekly_threshold = _get_codex_low_quota_thresholds()
+            if sticky_entry is not None and _codex_entry_below_low_quota(
+                sticky_entry,
+                five_hour_threshold,
+                weekly_threshold,
+            ):
+                five_hour_remaining, weekly_remaining = _extract_codex_quota_percents(sticky_entry)
+                logger.info(
+                    "Auxiliary compression: sticky Codex pool entry %s is below low quota thresholds "
+                    "(5h=%s weekly=%s; thresholds 5h<%s weekly<%s); using highest-priority available account",
+                    getattr(sticky_entry, "label", getattr(sticky_entry, "id", "")) or "codex",
+                    f"{five_hour_remaining:.1f}%" if isinstance(five_hour_remaining, (int, float)) else "--",
+                    f"{weekly_remaining:.1f}%" if isinstance(weekly_remaining, (int, float)) else "--",
+                    f"{five_hour_threshold:.1f}%",
+                    f"{weekly_threshold:.1f}%",
+                )
+                codex_pool_entry = highest_codex_entry
+            elif sticky_entry is None and _codex_entry_below_low_quota(
+                codex_pool_entry,
+                five_hour_threshold,
+                weekly_threshold,
+            ):
+                five_hour_remaining, weekly_remaining = _extract_codex_quota_percents(codex_pool_entry)
+                logger.info(
+                    "Auxiliary compression: selected Codex pool entry %s is below low quota thresholds "
+                    "(5h=%s weekly=%s; thresholds 5h<%s weekly<%s); using highest-priority available account",
+                    getattr(codex_pool_entry, "label", getattr(codex_pool_entry, "id", "")) or "codex",
+                    f"{five_hour_remaining:.1f}%" if isinstance(five_hour_remaining, (int, float)) else "--",
+                    f"{weekly_remaining:.1f}%" if isinstance(weekly_remaining, (int, float)) else "--",
+                    f"{five_hour_threshold:.1f}%",
+                    f"{weekly_threshold:.1f}%",
+                )
             client_provider = "openai-codex"
             client_base_url = _pool_runtime_base_url(codex_pool_entry, _CODEX_AUX_BASE_URL) or _CODEX_AUX_BASE_URL
             client_api_key = _pool_runtime_api_key(codex_pool_entry)
             if client_api_key:
                 client_model = client_model or runtime_model or resolved_model
-                five_hour_threshold, weekly_threshold = _get_codex_low_quota_thresholds()
-                if _codex_entry_below_low_quota(codex_pool_entry, five_hour_threshold, weekly_threshold):
-                    five_hour_remaining, weekly_remaining = _extract_codex_quota_percents(codex_pool_entry)
-                    logger.info(
-                        "Auxiliary compression: selected Codex pool entry %s is below low quota thresholds "
-                        "(5h=%s weekly=%s; thresholds 5h<%s weekly<%s); using highest-priority available account",
-                        getattr(codex_pool_entry, "label", getattr(codex_pool_entry, "id", "")) or "codex",
-                        f"{five_hour_remaining:.1f}%" if isinstance(five_hour_remaining, (int, float)) else "--",
-                        f"{weekly_remaining:.1f}%" if isinstance(weekly_remaining, (int, float)) else "--",
-                        f"{five_hour_threshold:.1f}%",
-                        f"{weekly_threshold:.1f}%",
-                    )
             else:
                 codex_pool = None
                 codex_pool_entry = None

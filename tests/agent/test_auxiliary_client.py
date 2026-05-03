@@ -1052,6 +1052,65 @@ class TestCallLlmCodexCompressionRetry:
         assert cached_calls[1][3] == "token-live-top"
         assert "token-stale-next" not in [call[3] for call in cached_calls]
 
+    def test_explicit_sticky_runtime_does_not_bypass_low_quota_compression_reroute(self, monkeypatch):
+        from types import SimpleNamespace
+
+        sticky_entry = SimpleNamespace(
+            id="sticky-low",
+            label="sticky-plus-0%-69%",
+            runtime_api_key="token-sticky-low",
+            runtime_base_url="https://chatgpt.com/backend-api/codex",
+        )
+        top_entry = SimpleNamespace(
+            id="live-top",
+            label="top-plus-92%-83%",
+            runtime_api_key="token-live-top",
+            runtime_base_url="https://chatgpt.com/backend-api/codex",
+        )
+
+        class LivePool:
+            def has_credentials(self):
+                return True
+
+            def _available_entries(self, clear_expired=True, refresh=True):
+                return [top_entry, sticky_entry]
+
+        top_client = MagicMock()
+        top_client.base_url = top_entry.runtime_base_url
+        top_response = MagicMock()
+        top_response.choices = [MagicMock(message=MagicMock(content="summary from live top account"))]
+        top_client.chat.completions.create.return_value = top_response
+
+        cached_calls = []
+
+        def fake_get_cached_client(provider, model, async_mode=False, base_url=None, api_key=None, api_mode=None, main_runtime=None, is_vision=False):
+            cached_calls.append((provider, model, base_url, api_key))
+            if api_key == "token-live-top":
+                return top_client, model
+            raise AssertionError(f"low-quota sticky credential should not be used: {api_key!r}")
+
+        with patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("auto", "gpt-5.4", None, None, None)), \
+             patch("agent.auxiliary_client.load_pool", return_value=LivePool()), \
+             patch("agent.auxiliary_client._get_cached_client", side_effect=fake_get_cached_client), \
+             patch("agent.auxiliary_client._validate_llm_response", side_effect=lambda resp, _task: resp):
+            result = call_llm(
+                task="compression",
+                main_runtime={
+                    "provider": "openai-codex",
+                    "model": "gpt-5.4",
+                    "base_url": sticky_entry.runtime_base_url,
+                    "api_key": sticky_entry.runtime_api_key,
+                    "api_mode": "codex_responses",
+                },
+                messages=[{"role": "user", "content": "compress"}],
+            )
+
+        assert result is top_response
+        assert cached_calls == [
+            ("openai-codex", "gpt-5.4", top_entry.runtime_base_url, "token-live-top")
+        ]
+
 
 # ---------------------------------------------------------------------------
 # Gate: _resolve_api_key_provider must skip anthropic when not configured
