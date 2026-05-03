@@ -768,6 +768,11 @@ class TestIsPaymentError:
         exc.status_code = 429
         assert _is_payment_error(exc) is True
 
+    def test_429_usage_limit_reached_message(self):
+        exc = Exception("Error code: 429 - {'error': {'type': 'usage_limit_reached', 'message': 'The usage limit has been reached', 'resets_at': 1777785994}}")
+        exc.status_code = 429
+        assert _is_payment_error(exc) is True
+
     def test_429_without_credits_message_is_not_payment(self):
         """Normal rate limits should NOT be treated as payment errors."""
         exc = Exception("Rate limit exceeded, try again in 2 seconds")
@@ -884,6 +889,169 @@ class TestCallLlmPaymentFallback:
                     task="compression",
                     messages=[{"role": "user", "content": "hello"}],
                 )
+
+class TestCallLlmCodexCompressionRetry:
+    """Compression should rotate openai-codex pool entries on usage-limit 429s."""
+
+    def test_codex_usage_limit_retries_with_next_pool_entry(self, monkeypatch):
+        from types import SimpleNamespace
+
+        first_entry = SimpleNamespace(
+            id="codex-1",
+            label="codex-1-plus-10%-4%",
+            runtime_api_key="token-one",
+            runtime_base_url="https://chatgpt.com/backend-api/codex",
+        )
+        second_entry = SimpleNamespace(
+            id="codex-2",
+            label="codex-2-plus-90%-80%",
+            runtime_api_key="token-two",
+            runtime_base_url="https://chatgpt.com/backend-api/codex",
+        )
+
+        class FakePool:
+            def __init__(self):
+                self.mark_calls = []
+                self.current = first_entry
+
+            def mark_exhausted_and_rotate(self, status_code, error_context=None):
+                self.mark_calls.append((status_code, error_context))
+                if self.current is first_entry:
+                    self.current = second_entry
+                    return second_entry
+                self.current = None
+                return None
+
+        usage_limit_err = Exception(
+            "Error code: 429 - {'error': {'type': 'usage_limit_reached', "
+            "'message': 'The usage limit has been reached', 'resets_at': 1777785994}}"
+        )
+        usage_limit_err.status_code = 429
+
+        first_client = MagicMock()
+        first_client.base_url = first_entry.runtime_base_url
+        first_client.chat.completions.create.side_effect = usage_limit_err
+
+        second_client = MagicMock()
+        second_client.base_url = second_entry.runtime_base_url
+        second_response = MagicMock()
+        second_response.choices = [MagicMock(message=MagicMock(content="summary from second account"))]
+        second_client.chat.completions.create.return_value = second_response
+
+        pool = FakePool()
+        cached_calls = []
+
+        def fake_get_cached_client(provider, model, async_mode=False, base_url=None, api_key=None, api_mode=None, main_runtime=None, is_vision=False):
+            cached_calls.append((provider, model, base_url, api_key))
+            if api_key == "token-one":
+                return first_client, model
+            if api_key == "token-two":
+                return second_client, model
+            return None, None
+
+        with patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("auto", "gpt-5.4", None, None, None)), \
+             patch("agent.auxiliary_client._select_highest_priority_pool_entry",
+                   return_value=(True, pool, first_entry)), \
+             patch("agent.auxiliary_client._get_cached_client", side_effect=fake_get_cached_client), \
+             patch("agent.auxiliary_client._validate_llm_response", side_effect=lambda resp, _task: resp):
+            result = call_llm(
+                task="compression",
+                main_runtime={"provider": "openai-codex", "model": "gpt-5.4"},
+                messages=[{"role": "user", "content": "compress"}],
+            )
+
+        assert result is second_response
+        assert pool.mark_calls and pool.mark_calls[0][0] == 429
+        assert pool.mark_calls[0][1]["reason"] == "usage_limit_reached"
+        assert cached_calls[0][0] == "openai-codex"
+        assert cached_calls[0][3] == "token-one"
+        assert cached_calls[1][3] == "token-two"
+
+    def test_codex_usage_limit_reloads_live_menubar_pool_for_retry(self, monkeypatch):
+        from types import SimpleNamespace
+
+        stale_entry = SimpleNamespace(
+            id="stale-1",
+            label="stale-plus-90%-90%",
+            runtime_api_key="token-stale",
+            runtime_base_url="https://chatgpt.com/backend-api/codex",
+        )
+        stale_next = SimpleNamespace(
+            id="stale-2",
+            label="stale-next-plus-80%-80%",
+            runtime_api_key="token-stale-next",
+            runtime_base_url="https://chatgpt.com/backend-api/codex",
+        )
+        live_next = SimpleNamespace(
+            id="live-1",
+            label="live-menubar-top-plus-99%-99%",
+            runtime_api_key="token-live-top",
+            runtime_base_url="https://chatgpt.com/backend-api/codex",
+        )
+
+        class StalePool:
+            def mark_exhausted_and_rotate(self, status_code, error_context=None):
+                return stale_next
+
+        class LivePool:
+            def __init__(self):
+                self.mark_calls = []
+
+            def has_credentials(self):
+                return True
+
+            def mark_exhausted_and_rotate(self, status_code, error_context=None):
+                self.mark_calls.append((status_code, error_context))
+                return live_next
+
+        usage_limit_err = Exception(
+            "Error code: 429 - {'error': {'type': 'usage_limit_reached', "
+            "'message': 'The usage limit has been reached', 'resets_at': 1777785994}}"
+        )
+        usage_limit_err.status_code = 429
+
+        first_client = MagicMock()
+        first_client.base_url = stale_entry.runtime_base_url
+        first_client.chat.completions.create.side_effect = usage_limit_err
+
+        live_client = MagicMock()
+        live_client.base_url = live_next.runtime_base_url
+        live_response = MagicMock()
+        live_response.choices = [MagicMock(message=MagicMock(content="summary from live top account"))]
+        live_client.chat.completions.create.return_value = live_response
+
+        stale_pool = StalePool()
+        live_pool = LivePool()
+        cached_calls = []
+
+        def fake_get_cached_client(provider, model, async_mode=False, base_url=None, api_key=None, api_mode=None, main_runtime=None, is_vision=False):
+            cached_calls.append((provider, model, base_url, api_key))
+            if api_key == "token-stale":
+                return first_client, model
+            if api_key == "token-live-top":
+                return live_client, model
+            raise AssertionError(f"unexpected api_key {api_key!r}")
+
+        with patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("auto", "gpt-5.4", None, None, None)), \
+             patch("agent.auxiliary_client._select_highest_priority_pool_entry",
+                   return_value=(True, stale_pool, stale_entry)), \
+             patch("agent.auxiliary_client.load_pool", return_value=live_pool), \
+             patch("agent.auxiliary_client._get_cached_client", side_effect=fake_get_cached_client), \
+             patch("agent.auxiliary_client._validate_llm_response", side_effect=lambda resp, _task: resp):
+            result = call_llm(
+                task="compression",
+                main_runtime={"provider": "openai-codex", "model": "gpt-5.4"},
+                messages=[{"role": "user", "content": "compress"}],
+            )
+
+        assert result is live_response
+        assert live_pool.mark_calls and live_pool.mark_calls[0][0] == 429
+        assert cached_calls[0][3] == "token-stale"
+        assert cached_calls[1][3] == "token-live-top"
+        assert "token-stale-next" not in [call[3] for call in cached_calls]
+
 
 # ---------------------------------------------------------------------------
 # Gate: _resolve_api_key_provider must skip anthropic when not configured

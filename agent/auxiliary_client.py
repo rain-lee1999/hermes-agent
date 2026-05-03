@@ -43,6 +43,7 @@ Payment / credit exhaustion fallback:
 import json
 import logging
 import os
+import re
 import threading
 import time
 from pathlib import Path  # noqa: F401 — used by test mocks
@@ -379,6 +380,148 @@ def _select_pool_entry(provider: str) -> Tuple[bool, Optional[Any]]:
     except Exception as exc:
         logger.debug("Auxiliary client: could not select pool entry for %s: %s", provider, exc)
         return True, None
+
+
+def _select_highest_priority_pool_entry(provider: str) -> Tuple[bool, Optional[Any], Optional[Any]]:
+    """Return (pool_exists_for_provider, pool, highest-priority available entry).
+
+    The entry is chosen directly from the available pool entries in priority
+    order so compression can pin the best-ranked Codex credential instead of
+    inheriting whichever client happened to be cached earlier in the session.
+    """
+    try:
+        pool = load_pool(provider)
+    except Exception as exc:
+        logger.debug("Auxiliary client: could not load pool for %s: %s", provider, exc)
+        return False, None, None
+    if not pool or not pool.has_credentials():
+        return False, None, None
+    try:
+        available = pool._available_entries(clear_expired=True, refresh=True)
+    except Exception as exc:
+        logger.debug("Auxiliary client: could not list available pool entries for %s: %s", provider, exc)
+        return True, pool, None
+    if not available:
+        return True, pool, None
+    entry = available[0]
+    try:
+        pool._current_id = getattr(entry, "id", None)
+    except Exception:
+        pass
+    return True, pool, entry
+
+
+def _codex_live_pool_after_usage_limit(current_pool: Any, failed_entry: Any, error_context: Dict[str, Any]) -> Tuple[Any, Optional[Any]]:
+    """Reload the live Codex pool and select the realtime highest-ranked entry.
+
+    Menubar sync may reorder ``~/.hermes/auth.json`` while a compression request
+    is already in flight.  On ``usage_limit_reached`` we therefore reload the
+    pool from disk before retrying, mark the matching failed credential if it is
+    still present, then select the current live priority-0 available account.
+    """
+    try:
+        live_pool = load_pool("openai-codex")
+        if live_pool is not None and live_pool.has_credentials():
+            selector = getattr(live_pool, "mark_matching_exhausted_and_select", None)
+            if callable(selector):
+                return live_pool, selector(
+                    failed_entry,
+                    status_code=429,
+                    error_context=error_context,
+                )
+            return live_pool, live_pool.mark_exhausted_and_rotate(
+                status_code=429,
+                error_context=error_context,
+            )
+    except Exception as exc:
+        logger.debug("Auxiliary compression: could not reload live Codex pool after usage limit: %s", exc)
+    return current_pool, current_pool.mark_exhausted_and_rotate(
+        status_code=429,
+        error_context=error_context,
+    )
+
+
+def _parse_percentage_value(value: Any) -> Optional[float]:
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+        return numeric if numeric == numeric else None
+    if isinstance(value, str):
+        text = value.strip().rstrip("%")
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            return None
+    return None
+
+
+_CODEX_QUOTA_PERCENT_RE = re.compile(r"(\d+(?:\.\d+)?)%")
+
+
+def _extract_codex_quota_percents(entry: Any) -> Tuple[Optional[float], Optional[float]]:
+    """Return (five_hour_remaining_percent, weekly_remaining_percent).
+
+    Codex maintainer snapshots may store the quota percentages directly on the
+    pool entry or only in the human-readable label.  The label format is
+    ``account-plan-fiveHourPercent-weeklyPercent`` so we parse the trailing two
+    percent markers when the structured fields are missing.
+    """
+    five_hour = _parse_percentage_value(getattr(entry, "fiveHourRemainingPercent", None))
+    weekly = _parse_percentage_value(getattr(entry, "weeklyRemainingPercent", None))
+    if five_hour is not None or weekly is not None:
+        return five_hour, weekly
+    label = str(getattr(entry, "label", "") or "")
+    matches = [float(m.group(1)) for m in _CODEX_QUOTA_PERCENT_RE.finditer(label)]
+    if len(matches) >= 2:
+        return matches[-2], matches[-1]
+    return None, None
+
+
+def _get_codex_low_quota_thresholds(task: str = "compression") -> Tuple[float, float]:
+    """Read the Codex quota thresholds used to avoid low-remaining accounts."""
+    task_config = _get_auxiliary_task_config(task)
+
+    def _read_threshold(key: str, default: float) -> float:
+        raw = task_config.get(key)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return default
+        return value if value == value else default
+
+    return (
+        _read_threshold("codex_low_quota_5h_remaining_threshold", 20.0),
+        _read_threshold("codex_low_quota_weekly_remaining_threshold", 5.0),
+    )
+
+
+def _codex_entry_below_low_quota(entry: Any, five_hour_threshold: float, weekly_threshold: float) -> bool:
+    five_hour, weekly = _extract_codex_quota_percents(entry)
+    return (
+        five_hour is not None and five_hour < five_hour_threshold
+    ) or (
+        weekly is not None and weekly < weekly_threshold
+    )
+
+
+def _extract_codex_reset_at(err_str: str) -> Optional[float]:
+    """Best-effort parse ``resets_at`` / ``resets_in_seconds`` from a 429 body."""
+    for pattern, relative in (
+        (r"['\"]?resets_at['\"]?\s*:\s*(\d+(?:\.\d+)?)", False),
+        (r"['\"]?resets_in_seconds['\"]?\s*:\s*(\d+(?:\.\d+)?)", True),
+    ):
+        match = re.search(pattern, err_str, flags=re.IGNORECASE)
+        if not match:
+            continue
+        try:
+            value = float(match.group(1))
+        except ValueError:
+            continue
+        if relative:
+            return time.time() + value
+        return value
+    return None
 
 
 def _pool_runtime_api_key(entry: Any) -> str:
@@ -1581,11 +1724,25 @@ def _is_payment_error(exc: Exception) -> bool:
     # OpenRouter and other providers include "credits" or "afford" in 402 bodies,
     # but sometimes wrap them in 429 or other codes.
     if status in (402, 429, None):
-        if any(kw in err_lower for kw in ("credits", "insufficient funds",
-                                           "can only afford", "billing",
-                                           "payment required")):
+        if any(kw in err_lower for kw in (
+            "credits",
+            "insufficient funds",
+            "can only afford",
+            "billing",
+            "payment required",
+            "usage_limit_reached",
+            "usage limit reached",
+        )):
             return True
     return False
+
+
+def _is_codex_usage_limit_error(exc: Exception) -> bool:
+    """Detect the Codex-specific 429 quota payload that should rotate pools."""
+    err_lower = str(exc).lower()
+    if "usage_limit_reached" in err_lower:
+        return True
+    return "usage limit reached" in err_lower
 
 
 def _is_connection_error(exc: Exception) -> bool:
@@ -3344,6 +3501,46 @@ def call_llm(
         task, provider, model, base_url, api_key)
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
+    runtime = _normalize_main_runtime(main_runtime)
+    runtime_provider = runtime.get("provider", "")
+    runtime_model = runtime.get("model", "")
+    runtime_base_url = runtime.get("base_url", "")
+    runtime_api_key = runtime.get("api_key", "")
+    client_provider = resolved_provider
+    client_model = resolved_model or runtime_model
+    client_base_url = resolved_base_url
+    client_api_key = resolved_api_key
+    codex_pool = None
+    codex_pool_entry = None
+    if (
+        task == "compression"
+        and runtime_provider == "openai-codex"
+        and not runtime_base_url
+        and not runtime_api_key
+        and resolved_provider in ("auto", "openai-codex", "", None)
+    ):
+        pool_present, codex_pool, codex_pool_entry = _select_highest_priority_pool_entry("openai-codex")
+        if pool_present and codex_pool_entry is not None:
+            client_provider = "openai-codex"
+            client_base_url = _pool_runtime_base_url(codex_pool_entry, _CODEX_AUX_BASE_URL) or _CODEX_AUX_BASE_URL
+            client_api_key = _pool_runtime_api_key(codex_pool_entry)
+            if client_api_key:
+                client_model = client_model or runtime_model or resolved_model
+                five_hour_threshold, weekly_threshold = _get_codex_low_quota_thresholds()
+                if _codex_entry_below_low_quota(codex_pool_entry, five_hour_threshold, weekly_threshold):
+                    five_hour_remaining, weekly_remaining = _extract_codex_quota_percents(codex_pool_entry)
+                    logger.info(
+                        "Auxiliary compression: selected Codex pool entry %s is below low quota thresholds "
+                        "(5h=%s weekly=%s; thresholds 5h<%s weekly<%s); using highest-priority available account",
+                        getattr(codex_pool_entry, "label", getattr(codex_pool_entry, "id", "")) or "codex",
+                        f"{five_hour_remaining:.1f}%" if isinstance(five_hour_remaining, (int, float)) else "--",
+                        f"{weekly_remaining:.1f}%" if isinstance(weekly_remaining, (int, float)) else "--",
+                        f"{five_hour_threshold:.1f}%",
+                        f"{weekly_threshold:.1f}%",
+                    )
+            else:
+                codex_pool = None
+                codex_pool_entry = None
 
     if task == "vision":
         effective_provider, client, final_model = resolve_vision_provider_client(
@@ -3371,10 +3568,10 @@ def call_llm(
         resolved_provider = effective_provider or resolved_provider
     else:
         client, final_model = _get_cached_client(
-            resolved_provider,
-            resolved_model,
-            base_url=resolved_base_url,
-            api_key=resolved_api_key,
+            client_provider,
+            client_model,
+            base_url=client_base_url,
+            api_key=client_api_key,
             api_mode=resolved_api_mode,
             main_runtime=main_runtime,
         )
@@ -3409,17 +3606,17 @@ def call_llm(
     _base_info = str(getattr(client, "base_url", resolved_base_url) or "")
     if task:
         logger.info("Auxiliary %s: using %s (%s)%s",
-                     task, resolved_provider or "auto", final_model or "default",
+                     task, client_provider or resolved_provider or "auto", final_model or "default",
                      f" at {_base_info}" if _base_info and "openrouter" not in _base_info else "")
 
     # Pass the client's actual base_url (not just resolved_base_url) so
     # endpoint-specific temperature overrides can distinguish
     # api.moonshot.ai vs api.kimi.com/coding even on auto-detected routes.
     kwargs = _build_call_kwargs(
-        resolved_provider, final_model, messages,
+        client_provider, final_model, messages,
         temperature=temperature, max_tokens=max_tokens,
         tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
-        base_url=_base_info or resolved_base_url)
+        base_url=_base_info or client_base_url)
 
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
     _client_base = str(getattr(client, "base_url", "") or "")
@@ -3518,10 +3715,10 @@ def call_llm(
                     )[1:]
                     if task == "vision"
                     else _get_cached_client(
-                        resolved_provider,
-                        resolved_model,
-                        base_url=resolved_base_url,
-                        api_key=resolved_api_key,
+                        client_provider,
+                        client_model,
+                        base_url=client_base_url,
+                        api_key=client_api_key,
                         api_mode=resolved_api_mode,
                         main_runtime=main_runtime,
                     )
@@ -3543,6 +3740,68 @@ def call_llm(
                         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
                     return _validate_llm_response(
                         retry_client.chat.completions.create(**retry_kwargs), task)
+
+        if (
+            task == "compression"
+            and codex_pool is not None
+            and codex_pool_entry is not None
+            and _is_codex_usage_limit_error(first_err)
+        ):
+            codex_error_context = {
+                "reason": "usage_limit_reached",
+                "message": err_str,
+                "reset_at": _extract_codex_reset_at(err_str),
+            }
+            while True:
+                codex_pool, next_entry = _codex_live_pool_after_usage_limit(
+                    codex_pool,
+                    codex_pool_entry,
+                    codex_error_context,
+                )
+                if next_entry is None:
+                    break
+                codex_pool_entry = next_entry
+                next_api_key = _pool_runtime_api_key(next_entry)
+                next_base_url = _pool_runtime_base_url(next_entry, _CODEX_AUX_BASE_URL) or _CODEX_AUX_BASE_URL
+                if not next_api_key:
+                    continue
+                retry_client, retry_model = _get_cached_client(
+                    "openai-codex",
+                    client_model,
+                    base_url=next_base_url,
+                    api_key=next_api_key,
+                    api_mode=resolved_api_mode,
+                    main_runtime=main_runtime,
+                )
+                if retry_client is None:
+                    continue
+                retry_kwargs = _build_call_kwargs(
+                    "openai-codex",
+                    retry_model or final_model,
+                    messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    tools=tools,
+                    timeout=effective_timeout,
+                    extra_body=effective_extra_body,
+                    base_url=next_base_url,
+                )
+                if _is_anthropic_compat_endpoint("openai-codex", str(getattr(retry_client, "base_url", "") or "")):
+                    retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
+                try:
+                    return _validate_llm_response(
+                        retry_client.chat.completions.create(**retry_kwargs), task)
+                except Exception as retry_err:
+                    if _is_codex_usage_limit_error(retry_err):
+                        first_err = retry_err
+                        err_str = str(retry_err)
+                        codex_error_context = {
+                            "reason": "usage_limit_reached",
+                            "message": err_str,
+                            "reset_at": _extract_codex_reset_at(err_str),
+                        }
+                        continue
+                    raise
 
         # ── Payment / credit exhaustion fallback ──────────────────────
         # When the resolved provider returns 402 or a credit-related error,

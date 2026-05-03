@@ -4246,7 +4246,7 @@ class AIAgent:
         if isinstance(body, dict):
             payload = body.get("error") if isinstance(body.get("error"), dict) else body
         if isinstance(payload, dict):
-            reason = payload.get("code") or payload.get("error")
+            reason = payload.get("code") or payload.get("error") or payload.get("type")
             if isinstance(reason, str) and reason.strip():
                 context["reason"] = reason.strip()
             message = payload.get("message") or payload.get("error_description")
@@ -6387,8 +6387,63 @@ class AIAgent:
         self.base_url = runtime_base.rstrip("/") if isinstance(runtime_base, str) else runtime_base
         self._client_kwargs["api_key"] = self.api_key
         self._client_kwargs["base_url"] = self.base_url
+        if self.provider == "nous" and base_url_host_matches(self.base_url, "inference-api.nousresearch.com"):
+            self.api_mode = "chat_completions"
         self._apply_client_headers_for_base_url(self.base_url)
         self._replace_primary_openai_client(reason="credential_rotation")
+
+    def _codex_usage_limit_live_pool(self, error_context: Optional[Dict[str, Any]]) -> Optional[Any]:
+        provider = (getattr(self, "provider", "") or "").strip().lower()
+        if provider != "openai-codex":
+            return None
+        reason = ""
+        if isinstance(error_context, dict):
+            reason = str(error_context.get("reason") or "").strip().lower()
+        if reason != "usage_limit_reached":
+            return None
+        try:
+            from agent.credential_pool import load_pool
+
+            live_pool = load_pool("openai-codex")
+            if live_pool is not None and live_pool.has_credentials():
+                logger.info(
+                    "Codex usage-limit recovery: reloaded credential pool from disk before rotation"
+                )
+                return live_pool
+        except Exception as exc:
+            logger.debug("Codex usage-limit recovery: failed to reload live pool: %s", exc)
+        return None
+
+    def _rotate_credential_pool_entry(
+        self,
+        pool: Any,
+        *,
+        status_code: Optional[int],
+        error_context: Optional[Dict[str, Any]],
+    ) -> tuple[Any, Optional[Any]]:
+        live_pool = self._codex_usage_limit_live_pool(error_context)
+        if live_pool is not None:
+            failed_entry = None
+            try:
+                failed_entry = pool.current()
+            except Exception:
+                failed_entry = None
+            self._credential_pool = live_pool
+            selector = getattr(live_pool, "mark_matching_exhausted_and_select", None)
+            if callable(selector):
+                return live_pool, selector(
+                    failed_entry,
+                    status_code=status_code,
+                    error_context=error_context,
+                )
+            return live_pool, live_pool.mark_exhausted_and_rotate(
+                status_code=status_code,
+                error_context=error_context,
+            )
+        return pool, pool.mark_exhausted_and_rotate(
+            status_code=status_code,
+            error_context=error_context,
+        )
 
     def _recover_with_credential_pool(
         self,
@@ -6417,6 +6472,15 @@ class AIAgent:
             return False, has_retried_429
 
         effective_reason = classified_reason
+        reason = ""
+        if isinstance(error_context, dict):
+            reason = str(error_context.get("reason") or "").strip().lower()
+        if (
+            (getattr(self, "provider", "") or "").strip().lower() == "openai-codex"
+            and status_code == 429
+            and reason == "usage_limit_reached"
+        ):
+            effective_reason = FailoverReason.billing
         if effective_reason is None:
             if status_code == 402:
                 effective_reason = FailoverReason.billing
@@ -6427,7 +6491,11 @@ class AIAgent:
 
         if effective_reason == FailoverReason.billing:
             rotate_status = status_code if status_code is not None else 402
-            next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
+            pool, next_entry = self._rotate_credential_pool_entry(
+                pool,
+                status_code=rotate_status,
+                error_context=error_context,
+            )
             if next_entry is not None:
                 logger.info(
                     "Credential %s (billing) — rotated to pool entry %s",
@@ -6442,7 +6510,11 @@ class AIAgent:
             if not has_retried_429:
                 return False, True
             rotate_status = status_code if status_code is not None else 429
-            next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
+            pool, next_entry = self._rotate_credential_pool_entry(
+                pool,
+                status_code=rotate_status,
+                error_context=error_context,
+            )
             if next_entry is not None:
                 logger.info(
                     "Credential %s (rate limit) — rotated to pool entry %s",

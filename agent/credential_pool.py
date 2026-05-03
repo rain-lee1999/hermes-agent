@@ -953,6 +953,54 @@ class CredentialPool:
                 logger.info("credential pool: rotated to %s", _next_label)
             return next_entry
 
+    def mark_matching_exhausted_and_select(
+        self,
+        failed_entry: Optional[PooledCredential],
+        *,
+        status_code: Optional[int],
+        error_context: Optional[Dict[str, Any]] = None,
+    ) -> Optional[PooledCredential]:
+        """Mark a matching failed entry exhausted, then select live top priority.
+
+        This is used after reloading a fresh pool from disk during Codex quota
+        failover.  Menubar may have rewritten the credential order since the
+        request started, so the stale in-memory current entry is not necessarily
+        the live priority-0 account anymore.  If the failed credential can still
+        be matched in the fresh pool, mark that specific entry exhausted; if it
+        cannot be matched, do not penalize the live top entry — simply select
+        the highest-priority currently available credential.
+        """
+        with self._lock:
+            matched = self._find_matching_entry(failed_entry)
+            if matched is not None:
+                _label = matched.label or matched.id[:8]
+                logger.info(
+                    "credential pool: marking live-matched %s exhausted (status=%s), rotating",
+                    _label, status_code,
+                )
+                self._mark_exhausted(matched, status_code, error_context)
+            self._current_id = None
+            next_entry = self._select_unlocked()
+            if next_entry:
+                _next_label = next_entry.label or next_entry.id[:8]
+                logger.info("credential pool: selected live top %s", _next_label)
+            return next_entry
+
+    def _find_matching_entry(self, failed_entry: Optional[PooledCredential]) -> Optional[PooledCredential]:
+        if failed_entry is None:
+            return None
+        failed_id = str(getattr(failed_entry, "id", "") or "")
+        failed_source = str(getattr(failed_entry, "source", "") or "")
+        failed_token = str(getattr(failed_entry, "access_token", "") or "")
+        for entry in self._entries:
+            if failed_id and entry.id == failed_id:
+                return entry
+            if failed_source and entry.source == failed_source:
+                return entry
+            if failed_token and entry.access_token == failed_token:
+                return entry
+        return None
+
     def acquire_lease(self, credential_id: Optional[str] = None) -> Optional[str]:
         """Acquire a soft lease on a credential.
 

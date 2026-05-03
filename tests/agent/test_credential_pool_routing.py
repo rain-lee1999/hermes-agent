@@ -11,6 +11,8 @@ Covers:
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from agent.credential_pool import CredentialPool, PooledCredential
+
 
 # ---------------------------------------------------------------------------
 # 1. CLI _resolve_turn_agent_config includes credential_pool
@@ -37,6 +39,56 @@ class TestCliTurnRoutePool:
         route = bound("test message")
 
         assert route["runtime"]["credential_pool"] is fake_pool
+
+
+# ---------------------------------------------------------------------------
+# 1b. Live Menubar pool matching selection
+# ---------------------------------------------------------------------------
+
+class TestLivePoolMatchingSelection:
+    def test_mark_matching_exhausted_selects_live_top_when_failed_is_lower_priority(self):
+        failed = PooledCredential(
+            provider="openai-codex",
+            id="failed",
+            label="old-top",
+            auth_type="oauth",
+            priority=10,
+            source="manual:codex-file:auth.old.json",
+            access_token="old-token",
+        )
+        live_top = PooledCredential(
+            provider="openai-codex",
+            id="live-top",
+            label="live-top",
+            auth_type="oauth",
+            priority=0,
+            source="manual:codex-file:auth.live.json",
+            access_token="live-token",
+        )
+        failed_live_copy = PooledCredential(
+            provider="openai-codex",
+            id="failed-live",
+            label="old-top-now-lower",
+            auth_type="oauth",
+            priority=1,
+            source="manual:codex-file:auth.old.json",
+            access_token="old-token-refreshed",
+        )
+
+        pool = CredentialPool("openai-codex", [failed_live_copy, live_top])
+
+        with patch("agent.credential_pool.write_credential_pool"):
+            selected = pool.mark_matching_exhausted_and_select(
+                failed,
+                status_code=429,
+                error_context={"reason": "usage_limit_reached"},
+            )
+
+        assert selected is not None
+        assert selected.id == "live-top"
+        matched = next(entry for entry in pool.entries() if entry.id == "failed-live")
+        assert matched.last_status == "exhausted"
+        assert matched.last_error_reason == "usage_limit_reached"
 
 
 # ---------------------------------------------------------------------------

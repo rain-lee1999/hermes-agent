@@ -3379,6 +3379,49 @@ class TestCredentialPoolRecovery:
         assert retry_same is False
         agent._swap_credential.assert_called_once_with(next_entry)
 
+    def test_codex_usage_limit_reloads_live_pool_before_rotation(self, agent, monkeypatch):
+        stale_next = SimpleNamespace(label="stale-next", id="stale-next")
+        live_next = SimpleNamespace(label="live-menubar-top", id="live-next")
+
+        class _StalePool:
+            provider = "openai-codex"
+
+            def mark_exhausted_and_rotate(self, *, status_code, error_context=None):
+                return stale_next
+
+        class _LivePool:
+            provider = "openai-codex"
+
+            def __init__(self):
+                self.mark_calls = []
+
+            def has_credentials(self):
+                return True
+
+            def mark_exhausted_and_rotate(self, *, status_code, error_context=None):
+                self.mark_calls.append((status_code, error_context))
+                return live_next
+
+        live_pool = _LivePool()
+        agent.provider = "openai-codex"
+        agent._credential_pool = _StalePool()
+        agent._swap_credential = MagicMock()
+
+        monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: live_pool)
+
+        recovered, retry_same = agent._recover_with_credential_pool(
+            status_code=429,
+            has_retried_429=False,
+            classified_reason=FailoverReason.rate_limit,
+            error_context={"reason": "usage_limit_reached", "reset_at": 1777785994},
+        )
+
+        assert recovered is True
+        assert retry_same is False
+        assert agent._credential_pool is live_pool
+        assert live_pool.mark_calls == [(429, {"reason": "usage_limit_reached", "reset_at": 1777785994})]
+        agent._swap_credential.assert_called_once_with(live_next)
+
     def test_recover_with_pool_retries_first_429_then_rotates(self, agent):
         next_entry = SimpleNamespace(label="secondary")
 
@@ -3495,6 +3538,25 @@ class TestCredentialPoolRecovery:
         assert context["reason"] == "device_code_exhausted"
         assert context["message"] == "Weekly credits exhausted."
         assert context["reset_at"] == "2026-04-12T10:30:00Z"
+
+    def test_extract_api_error_context_uses_type_when_code_absent(self, agent):
+        response = SimpleNamespace(headers={})
+        error = SimpleNamespace(
+            body={
+                "error": {
+                    "type": "usage_limit_reached",
+                    "message": "The usage limit has been reached",
+                    "resets_at": 1777785994,
+                }
+            },
+            response=response,
+        )
+
+        context = agent._extract_api_error_context(error)
+
+        assert context["reason"] == "usage_limit_reached"
+        assert context["message"] == "The usage limit has been reached"
+        assert context["reset_at"] == 1777785994
 
     def test_recover_with_pool_passes_error_context_on_rotated_429(self, agent):
         next_entry = SimpleNamespace(label="secondary")
