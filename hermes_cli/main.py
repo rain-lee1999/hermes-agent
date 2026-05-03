@@ -6712,13 +6712,20 @@ def _cmd_update_impl(args, gateway_mode: bool):
         else None
     )
     assume_yes = bool(getattr(args, "yes", False))
+    simple_mode = bool(getattr(args, "simple", False))
 
     print("⚕ Updating Hermes Agent...")
     print()
 
     # Pre-update backup — runs before any git/file mutation so users can
     # always roll back to the exact state they had before this update.
-    _run_pre_update_backup(args)
+    # --simple is intentionally the fast path: skip config-enabled backups
+    # unless the user explicitly opts back in with --backup.
+    if simple_mode and not getattr(args, "backup", False):
+        print("◆ Simple update: pre-update backup skipped")
+        print()
+    else:
+        _run_pre_update_backup(args)
 
     # Try git-based update first, fall back to ZIP download on Windows
     # when git file I/O is broken (antivirus, NTFS filter drivers, etc.)
@@ -6992,6 +6999,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
             print(
                 f"  ✓ Cleared {removed} stale __pycache__ director{'y' if removed == 1 else 'ies'}"
             )
+
+        if simple_mode:
+            print()
+            print("✓ Code updated (simple mode).")
+            print("  Skipped: dependency reinstall, Node/web builds, skill/profile sync,")
+            print("           config drift check, gateway/dashboard restart, upstream fork sync.")
+            print("  If dependencies or frontend assets changed, run plain `hermes update` once.")
+            return
 
         # Fork upstream sync logic (only for main branch on forks)
         if not local_source_repo and is_fork and branch == "main":
@@ -9959,6 +9974,12 @@ Examples:
         action="store_true",
         default=False,
         help="Skip bundled skill sync for this run",
+    )
+    update_parser.add_argument(
+        "--simple",
+        action="store_true",
+        default=False,
+        help="Fast code-only update: git fetch/pull plus cache invalidation; skip dependency reinstall, builds, syncs, config checks, and restarts",
     )
     update_parser.add_argument(
         "--yes",

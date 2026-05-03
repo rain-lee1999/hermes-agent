@@ -25,6 +25,8 @@ def resolve_local_update_source_repo(project_root: Path | None = None) -> Option
     2. A sibling checkout whose name matches the current repo minus a
        trailing ``-update`` suffix.
     3. A sibling ``hermes-agent`` checkout.
+    4. The user's canonical development checkout under
+       ``~/dev/-github/hermes-agent``.
 
     The helper is intentionally conservative: if no local checkout can be
     verified, callers should fall back to their normal remote-based update
@@ -41,6 +43,7 @@ def resolve_local_update_source_repo(project_root: Path | None = None) -> Option
         candidates.append(root.with_name(root.name.removesuffix("-update")))
 
     candidates.append(root.with_name("hermes-agent"))
+    candidates.append(Path.home() / "dev" / "-github" / "hermes-agent")
 
     seen: set[Path] = set()
     for candidate in candidates:
