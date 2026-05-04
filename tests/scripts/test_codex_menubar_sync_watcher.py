@@ -29,6 +29,31 @@ def test_watcher_fingerprint_changes_when_watched_file_changes(tmp_path):
     assert first != second
 
 
+def test_watcher_run_sync_enables_full_five_hour_prime(tmp_path):
+    watcher = load_script("HermesCodexAccountSyncWatcher")
+    fake_sync = tmp_path / "fake_sync.py"
+    fake_sync.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "if '--prime-full-five-hour' not in sys.argv:\n"
+        "    raise SystemExit(2)\n"
+        "print(json.dumps({\n"
+        "    'applied': True,\n"
+        "    'changed': False,\n"
+        "    'provider_synced': False,\n"
+        "    'five_hour_prime': {'candidates': [{}], 'triggered': [{}], 'failed': []},\n"
+        "}))\n",
+        encoding="utf-8",
+    )
+
+    result = watcher.run_sync(fake_sync)
+
+    assert result["ok"] is True
+    assert result["five_hour_prime_candidates"] == 1
+    assert result["five_hour_prime_triggered"] == 1
+    assert result["five_hour_prime_failed"] == 0
+
+
 def test_installer_renders_repo_owned_watcher_plist(monkeypatch, tmp_path):
     installer = load_script("install_codex_menubar_sync_watcher.py")
     watcher = tmp_path / "HermesCodexAccountSyncWatcher"

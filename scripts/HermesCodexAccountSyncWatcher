@@ -59,7 +59,7 @@ def log_event(event: dict) -> None:
 
 def run_sync(script_path: Path | None = None) -> dict:
     script_path = script_path or sync_script_path()
-    cmd = [sys.executable, str(script_path), "--apply", "--quiet"]
+    cmd = [sys.executable, str(script_path), "--apply", "--prime-full-five-hour", "--quiet"]
     proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if proc.returncode != 0:
         return {
@@ -81,6 +81,9 @@ def run_sync(script_path: Path | None = None) -> dict:
         "matched_entries": len(payload.get("matched_entries") or []),
         "ranked_rows": len(payload.get("ranked_rows") or []),
         "backup_created": bool(payload.get("backup")),
+        "five_hour_prime_candidates": len((payload.get("five_hour_prime") or {}).get("candidates") or []),
+        "five_hour_prime_triggered": len((payload.get("five_hour_prime") or {}).get("triggered") or []),
+        "five_hour_prime_failed": len((payload.get("five_hour_prime") or {}).get("failed") or []),
     }
 
 
