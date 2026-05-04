@@ -1,6 +1,6 @@
 ---
 branch: auth
-purpose: keep same-session account selection sticky across main and auxiliary routing
+purpose: Codex account stickiness, Menubar auth sync, and conservative five-hour quota priming
 read_first: README.md
 spec: null
 plan: null
@@ -9,64 +9,91 @@ primary_files:
   - run_agent.py
   - hermes_cli/runtime_provider.py
   - agent/auxiliary_client.py
-  - tests/cli/test_cli_provider_resolution.py
-  - tests/agent/test_auxiliary_main_first.py
-  - tests/agent/test_codex_cloudflare_headers.py
+  - agent/credential_pool.py
+  - scripts/reorder_codex_by_menubar_quota.py
+  - scripts/HermesCodexAccountSyncWatcher
+  - tests/scripts/test_reorder_codex_by_menubar_quota.py
+  - tests/scripts/test_codex_menubar_sync_watcher.py
 ---
 
 # auth AI brief
 
 ## One-line summary
 
-This branch fixes the bug where appending to the same session would keep reselecting the highest-priority account instead of preserving the already-bound session credential.
+This branch makes Hermes Codex account behavior truthful and sticky: same-session turns reuse the selected credential, Menubar-ranked account order syncs into Hermes auth state, and 100% five-hour quota accounts can be conservatively primed once to start their refresh window.
 
 ## Must-know concepts
 
-- Session-bound runtime credential: once a session has a usable credential, later turns should reuse it.
-- Main vs auxiliary routing: `cli.py` / `run_agent.py` handle the primary conversation, while `agent/auxiliary_client.py` handles compression, titles, and similar side calls.
-- Repo mirror vs installed runtime: changes were synchronized across `/Users/rain/hermes-agent` and `/Users/rain/dev/-github/hermes-agent-auth`, but `~/.hermes` remains a separate installed profile.
+- Session-bound runtime credential: a Hermes session should keep its chosen credential until a real failover or session boundary.
+- Menubar-first ordering: `last-menu-rows.json` is already ranked; Hermes preserves that order instead of re-sorting.
+- Pool vs singleton: `credential_pool.openai-codex` and `providers.openai-codex.tokens` must converge or direct readers can use the wrong account.
+- Five-hour prime: if an account is 100% and its reset still looks like a full 5h window, send one minimal non-stored Codex response to start the window.
+- Runtime vs repo: `~/.hermes` auth/prime state is installed runtime state, not branch-local source code.
 
 ## Before vs after
 
 ### Before
 
-- CLI active-session handling was sticky only on the surface.
-- `openai-codex` auxiliary routing could still reload the pool and call `select()` again.
-- Same-session append could jump back to the top-ranked account.
+- Auxiliary paths could reload the Codex pool and reselect the top account inside an existing session.
+- Menubar sync did not cover all truth surfaces equally: pool ordering, singleton tokens, labels/imported_from, and duplicated manual entries could diverge.
+- The watcher only synced auth order; 100% five-hour accounts could remain stuck showing a future 5h refresh because nothing consumed them.
 
 ### After
 
-- Active sessions keep the bound pool credential.
-- `main_runtime` carries the current credential into auxiliary routing.
-- `resolve_provider_client("openai-codex", ...)` prefers explicit runtime credentials and does not force pool reselection.
+- Main and auxiliary runtime paths preserve selected credential metadata where appropriate.
+- `reorder_codex_by_menubar_quota.py` syncs Menubar-ranked rows into Hermes pool and provider singleton.
+- `--prime-full-five-hour` detects full 5h/100% rows and posts a tiny Codex Responses request with `store=false`.
+- Prime state records both `row_id + fiveHourResetAt` and a 5-hour per-account cooldown to prevent short-interval repeated triggers.
+- `HermesCodexAccountSyncWatcher` now runs sync with `--prime-full-five-hour` and logs prime counts.
 
 ## Invariants to preserve
 
-1. Same session append must not reselect the top-ranked account unless there is a real failover.
-2. New sessions may still start from the normal priority order.
-3. Auxiliary tasks must inherit the same session credential semantics as the main turn.
+1. Same-session append must not reselect the top-ranked account unless there is real credential failure/failover.
+2. New sessions, `/new`, and first delegate creation may choose the current highest-priority available account.
+3. Menubar row order must remain the source of truth for Hermes Codex pool priority.
+4. Pool entry labels/imported_from/account_id must match the actual token material they represent.
+5. Five-hour prime must stay minimal, non-stored, independent from current Hermes conversation history, and rate-limited per account.
+6. Failed prime attempts must be reported but should not block normal auth sync or permanently mark the account primed.
 
 ## Where to look in code
 
-- `cli.py` — session credential stickiness and runtime refresh flow.
-- `run_agent.py` — propagates live main runtime into auxiliary calls.
-- `hermes_cli/runtime_provider.py` — builds the runtime dict passed around the app.
-- `agent/auxiliary_client.py` — the main fix for openai-codex explicit runtime credentials.
-- `tests/cli/test_cli_provider_resolution.py` — regression for active-session stickiness.
-- `tests/agent/test_auxiliary_main_first.py` / `tests/agent/test_codex_cloudflare_headers.py` — auxiliary routing regressions.
+- `scripts/reorder_codex_by_menubar_quota.py`
+  - `build_ranking`, `sync_entries`, `reorder_entries`, `sync_provider_singleton_from_primary_entry`
+  - five-hour prime helpers: `five_hour_prime_candidates`, `prime_five_hour_row`, `prime_full_five_hour_rows`, `row_recently_primed`
+- `scripts/HermesCodexAccountSyncWatcher`
+  - `run_sync()` now passes `--prime-full-five-hour` and summarizes prime counts.
+- `agent/credential_pool.py`
+  - pool entry truth, refresh, singleton sync, failover status.
+- `agent/auxiliary_client.py`
+  - auxiliary runtime routing and Codex explicit credential handling.
+- `run_agent.py` / `cli.py`
+  - selected credential propagation and session-boundary invalidation.
+- `tests/scripts/test_reorder_codex_by_menubar_quota.py`
+  - prime candidate, payload/header, cooldown regressions.
+- `tests/scripts/test_codex_menubar_sync_watcher.py`
+  - watcher command and summary regression.
 
 ## Fast mental model
 
-Think of the session as owning one runtime credential until it genuinely fails. The bug was that the auxiliary path treated every turn like a fresh lookup and silently picked the best-ranked account again.
+Think of Codex account handling as three layers that must agree: Menubar decides account order, Hermes auth state mirrors that truth, and live Hermes sessions keep their selected credential stable. The new prime path is outside the conversation path: it is a tiny maintenance request used only to start a five-hour refresh timer.
 
 ## Verification
 
-- `scripts/run_tests.sh tests/cli/test_cli_provider_resolution.py::test_active_session_keeps_bound_pool_credential_instead_of_reselecting_top -q`: pass
-- `scripts/run_tests.sh tests/agent/test_auxiliary_main_first.py::TestResolveAutoMainFirst tests/agent/test_codex_cloudflare_headers.py -q`: pass
-- Direct hermetic `python -m pytest` in the auth worktree using `/Users/rain/hermes-agent/venv`: pass
+Recent scoped verification:
+
+- `gitnexus analyze`: pass.
+- GitNexus impact on sync script symbols: LOW before editing.
+- RED/GREEN for five-hour prime and per-account cooldown: observed.
+- `scripts/run_tests.sh tests/scripts/test_reorder_codex_by_menubar_quota.py tests/scripts/test_codex_menubar_sync_watcher.py -q`: 9 passed.
+- `python3 scripts/reorder_codex_by_menubar_quota.py --quiet`: dry-run OK; no apply means no prime.
+- `git diff --check`: pass.
+- GitNexus detect-changes: medium, limited to expected sync-script flows.
+
+Testing note: this worktree lacks its own venv, so validation temporarily symlinked `venv` to `/Users/rain/hermes-agent/venv`; the symlink was removed after tests.
 
 ## Future work usually looks like
 
-- Propagate sticky runtime credentials into any new auxiliary route.
-- Add regression tests whenever a new provider path might re-open pool reselection.
-- Keep distinguishing branch-local repo edits from installed-profile state under `~/.hermes`.
+- Add regressions whenever a new Codex reader could bypass pool/selected credential truth.
+- If Menubar changes its row schema or ranking semantics, update sync logic and docs together.
+- If Codex changes Responses endpoint/model allow-list, adjust `resolve_prime_model` / prime request shape with tests.
+- Keep prime conservative: no large prompts, no transcript/session writes, no short-loop retries.

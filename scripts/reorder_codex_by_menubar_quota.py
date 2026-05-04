@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 from contextlib import contextmanager
 import datetime as dt
 import json
@@ -12,6 +13,13 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
+
+import httpx
+
+try:
+    import tomllib
+except ImportError:  # pragma: no cover - Python <3.11 fallback
+    tomllib = None
 
 try:
     import fcntl
@@ -25,6 +33,13 @@ CODEX_HOME = HOME / ".codex"
 BACKUP_DIR = HOME / ".hermes/backups"
 CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 FIVE_HOUR_MIN_REMAINING_PERCENT = 5.0
+FIVE_HOUR_WINDOW_SECONDS = 5 * 60 * 60
+FIVE_HOUR_PRIME_TOLERANCE_SECONDS = 30 * 60
+FIVE_HOUR_PRIME_COOLDOWN_SECONDS = FIVE_HOUR_WINDOW_SECONDS
+PRIME_STATE_PATH = HOME / ".hermes/codex-five-hour-prime-state.json"
+PRIME_STATE_COOLDOWN_KEY = "__row_cooldowns__"
+CODEX_CONFIG_PATH = CODEX_HOME / "config.toml"
+DEFAULT_CODEX_PRIME_MODEL = "gpt-5.4"
 AUTH_LOCK_TIMEOUT_SECONDS = 30.0
 
 
@@ -40,6 +55,232 @@ def quota_percent(row: dict[str, Any], key: str) -> float | None:
     if isinstance(value, (int, float)):
         return max(0.0, min(100.0, float(value)))
     return None
+
+
+def _unix_ts(value: Any) -> int | None:
+    if isinstance(value, (int, float)):
+        return int(value)
+    return None
+
+
+def _latest_five_hour_trend_point(row: dict[str, Any]) -> dict[str, Any] | None:
+    points = row.get("fiveHourTrendPoints")
+    if not isinstance(points, list):
+        return None
+    dict_points = [point for point in points if isinstance(point, dict)]
+    if not dict_points:
+        return None
+    return max(dict_points, key=lambda point: _unix_ts(point.get("recordedAt")) or 0)
+
+
+def _five_hour_reset_delta_seconds(row: dict[str, Any], now_ts: int) -> int | None:
+    reset_at = _unix_ts(row.get("fiveHourResetAt"))
+    if reset_at is None:
+        return None
+    latest = _latest_five_hour_trend_point(row)
+    if latest is not None and quota_percent(latest, "remainingPercent") == 100.0:
+        trend_reset_at = _unix_ts(latest.get("resetAt"))
+        recorded_at = _unix_ts(latest.get("recordedAt"))
+        if trend_reset_at is not None and recorded_at is not None:
+            return trend_reset_at - recorded_at
+    return reset_at - now_ts
+
+
+def should_prime_five_hour_window(row: dict[str, Any], *, now_ts: int | None = None) -> bool:
+    if not isinstance(row.get("id"), str):
+        return False
+    if str(row.get("usageState") or "").strip().lower() != "ok":
+        return False
+    if quota_percent(row, "fiveHourRemainingPercent") != 100.0:
+        return False
+    now_value = int(time.time()) if now_ts is None else int(now_ts)
+    reset_at = _unix_ts(row.get("fiveHourResetAt"))
+    if reset_at is None or reset_at <= now_value:
+        return False
+    delta = _five_hour_reset_delta_seconds(row, now_value)
+    if delta is None:
+        return False
+    return abs(delta - FIVE_HOUR_WINDOW_SECONDS) <= FIVE_HOUR_PRIME_TOLERANCE_SECONDS
+
+
+def five_hour_prime_candidates(rows: list[dict[str, Any]], *, now_ts: int | None = None) -> list[dict[str, Any]]:
+    return [row for row in rows if isinstance(row, dict) and should_prime_five_hour_window(row, now_ts=now_ts)]
+
+
+def _codex_account_id_from_access_token(access_token: str) -> str | None:
+    try:
+        parts = str(access_token or "").split(".")
+        if len(parts) < 2:
+            return None
+        payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload_b64))
+        account_id = claims.get("https://api.openai.com/auth", {}).get("chatgpt_account_id")
+        return account_id if isinstance(account_id, str) and account_id.strip() else None
+    except Exception:
+        return None
+
+
+def _codex_prime_headers(access_token: str, account_id: str | None) -> dict[str, str]:
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "codex_cli_rs/0.0.0 (Hermes Agent)",
+        "originator": "codex_cli_rs",
+    }
+    resolved_account_id = (account_id or "").strip() or _codex_account_id_from_access_token(access_token)
+    if resolved_account_id:
+        headers["ChatGPT-Account-ID"] = resolved_account_id
+    return headers
+
+
+def resolve_prime_model(explicit_model: str | None = None) -> str:
+    explicit = str(explicit_model or "").strip()
+    if explicit:
+        return explicit
+    env_model = os.getenv("HERMES_CODEX_PRIME_MODEL", "").strip()
+    if env_model:
+        return env_model
+    if tomllib is not None and CODEX_CONFIG_PATH.exists():
+        try:
+            data = tomllib.loads(CODEX_CONFIG_PATH.read_text(encoding="utf-8"))
+            model = str(data.get("model") or "").strip() if isinstance(data, dict) else ""
+            if model:
+                return model
+        except Exception:
+            pass
+    return DEFAULT_CODEX_PRIME_MODEL
+
+
+def prime_five_hour_row(row: dict[str, Any], auth_data: dict[str, Any], *, model: str | None = None) -> dict[str, Any]:
+    tokens = auth_data.get("tokens") or {}
+    access_token = str(tokens.get("access_token") or "").strip()
+    if not access_token:
+        raise ValueError(f"missing access token for {row.get('id')}")
+    account_id = tokens.get("account_id")
+    payload = {
+        "model": resolve_prime_model(model),
+        "instructions": "Reply with exactly: .",
+        "input": [{"role": "user", "content": "."}],
+        "store": False,
+    }
+    with httpx.Client(timeout=15.0) as client:
+        response = client.post(
+            f"{CODEX_BASE_URL}/responses",
+            headers=_codex_prime_headers(access_token, account_id if isinstance(account_id, str) else None),
+            json=payload,
+        )
+        response.raise_for_status()
+    body = response.json() if callable(getattr(response, "json", None)) else {}
+    return {
+        "ok": True,
+        "row_id": row.get("id"),
+        "label": label_from_row(row),
+        "model": payload["model"],
+        "response_id": body.get("id") if isinstance(body, dict) else None,
+    }
+
+
+def prime_state_key(row: dict[str, Any]) -> str:
+    return f"{row.get('id')}:{row.get('fiveHourResetAt')}"
+
+
+def load_prime_state(path: Path | None = None) -> dict[str, Any]:
+    state_path = path or PRIME_STATE_PATH
+    try:
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {}
+
+
+def save_prime_state(state: dict[str, Any], path: Path | None = None) -> None:
+    write_json_atomic(path or PRIME_STATE_PATH, state)
+
+
+def row_recently_primed(state: dict[str, Any], row_id: str, *, now_ts: int | None = None) -> bool:
+    cooldowns = state.get(PRIME_STATE_COOLDOWN_KEY)
+    if not isinstance(cooldowns, dict):
+        return False
+    entry = cooldowns.get(row_id)
+    if not isinstance(entry, dict):
+        return False
+    primed_at = entry.get("primed_at_ts")
+    if not isinstance(primed_at, (int, float)):
+        return False
+    now_value = int(time.time()) if now_ts is None else int(now_ts)
+    return 0 <= now_value - int(primed_at) < FIVE_HOUR_PRIME_COOLDOWN_SECONDS
+
+
+def remember_row_prime(state: dict[str, Any], row: dict[str, Any], result: dict[str, Any], *, now_ts: int | None = None) -> None:
+    row_id = str(row.get("id") or "")
+    if not row_id:
+        return
+    now_value = int(time.time()) if now_ts is None else int(now_ts)
+    cooldowns = state.setdefault(PRIME_STATE_COOLDOWN_KEY, {})
+    if not isinstance(cooldowns, dict):
+        cooldowns = {}
+        state[PRIME_STATE_COOLDOWN_KEY] = cooldowns
+    cooldowns[row_id] = {
+        "primed_at_ts": now_value,
+        "primed_at": dt.datetime.fromtimestamp(now_value, tz=dt.timezone.utc).isoformat(),
+        "fiveHourResetAt": row.get("fiveHourResetAt"),
+        "response_id": result.get("response_id"),
+        "model": result.get("model"),
+    }
+
+
+def _auth_data_for_row(row: dict[str, Any]) -> dict[str, Any]:
+    row_id = str(row.get("id") or "")
+    path = CODEX_HOME / ("auth.json" if row.get("isCurrent") is True else row_id)
+    data = load_json(path)
+    if not isinstance(data, dict):
+        raise ValueError(f"invalid Codex auth payload in {path}")
+    return data
+
+
+def prime_full_five_hour_rows(rows: list[dict[str, Any]], *, model: str | None = None) -> dict[str, Any]:
+    candidates = five_hour_prime_candidates(rows)
+    state = load_prime_state()
+    triggered: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    state_changed = False
+    now_ts = int(time.time())
+    for row in candidates:
+        row_id = str(row.get("id") or "")
+        key = prime_state_key(row)
+        if key in state:
+            skipped.append({"row_id": row.get("id"), "reason": "already_primed_for_reset"})
+            continue
+        if row_id and row_recently_primed(state, row_id, now_ts=now_ts):
+            skipped.append({"row_id": row.get("id"), "reason": "recently_primed"})
+            continue
+        try:
+            result = prime_five_hour_row(row, _auth_data_for_row(row), model=model)
+        except Exception as exc:  # noqa: BLE001 - report per-account and keep syncing others
+            failed.append({"row_id": row.get("id"), "reason": str(exc)})
+            continue
+        triggered.append(result)
+        state[key] = {
+            "row_id": row.get("id"),
+            "fiveHourResetAt": row.get("fiveHourResetAt"),
+            "primed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "response_id": result.get("response_id"),
+            "model": result.get("model"),
+        }
+        remember_row_prime(state, row, result, now_ts=now_ts)
+        state_changed = True
+    if state_changed:
+        save_prime_state(state)
+    return {
+        "candidates": [{"row_id": row.get("id"), "label": label_from_row(row)} for row in candidates],
+        "triggered": triggered,
+        "skipped": skipped,
+        "failed": failed,
+    }
 
 
 def effective_remaining_percent(row: dict[str, Any]) -> float:
@@ -541,6 +782,12 @@ def sync_provider_singleton_from_primary_entry(auth_store: dict[str, Any], reord
 def main() -> int:
     parser = argparse.ArgumentParser(description="Sync Hermes openai-codex credentials from CodexMaintainerMenubar quota snapshots.")
     parser.add_argument("--apply", action="store_true", help="Write the synced priorities and add/delete changes back to ~/.hermes/auth.json")
+    parser.add_argument(
+        "--prime-full-five-hour",
+        action="store_true",
+        help="When applying, send one minimal Codex response for 100% five-hour rows whose reset is still a full five-hour window away",
+    )
+    parser.add_argument("--prime-model", default=None, help="Model to use for the minimal Codex priming response; defaults to HERMES_CODEX_PRIME_MODEL, ~/.codex/config.toml, then gpt-5.4")
     parser.add_argument("--quiet", action="store_true", help="Only print JSON")
     args = parser.parse_args()
 
@@ -575,6 +822,10 @@ def main() -> int:
             auth_store["updated_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
             write_json_atomic(HERMES_AUTH_PATH, auth_store)
 
+    five_hour_prime = None
+    if args.apply and args.prime_full_five_hour:
+        five_hour_prime = prime_full_five_hour_rows(ranked_rows, model=args.prime_model)
+
     payload = {
         "app_rows_path": str(APP_ROWS_PATH),
         "hermes_auth_path": str(HERMES_AUTH_PATH),
@@ -590,7 +841,8 @@ def main() -> int:
         "matched_entries": [m for m in movement if m.get("matched_row_id")],
         "unmatched_entries": [m for m in movement if not m.get("matched_row_id")],
         "ranked_rows": ranked_matches,
-        "strategy_note": "preserves CodexMaintainerMenubar last-menu-rows.json order exactly; that file is already written after UsageRefreshService.ranked(...), so the first row is the Menubar top-ranked account and becomes Hermes openai-codex priority 0 / provider singleton when --apply is used; labels use account-plan-fiveHourPercent-weeklyPercent format",
+        "five_hour_prime": five_hour_prime,
+        "strategy_note": "preserves CodexMaintainerMenubar last-menu-rows.json order exactly; that file is already written after UsageRefreshService.ranked(...), so the first row is the Menubar top-ranked account and becomes Hermes openai-codex priority 0 / provider singleton when --apply is used; labels use account-plan-fiveHourPercent-weeklyPercent format; with --prime-full-five-hour, 100% five-hour rows whose reset is still a full five-hour window away are triggered once with a minimal non-stored Codex response so the five-hour refresh anchor can start",
     }
     if args.quiet:
         print(json.dumps(payload, ensure_ascii=False))

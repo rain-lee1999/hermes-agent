@@ -29,6 +29,31 @@ def row(row_id: str, display_name: str, *, weekly: int = 50, five_hour: int = 10
     }
 
 
+class _PrimeResponse:
+    status_code = 200
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return {"id": "resp_prime_123"}
+
+
+class _PrimeClient:
+    def __init__(self):
+        self.requests = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def post(self, url, headers=None, json=None):
+        self.requests.append({"url": url, "headers": headers or {}, "json": json or {}})
+        return _PrimeResponse()
+
+
 def entry(row_id: str, label: str, access: str, refresh: str, priority: int) -> dict:
     return {
         "label": label,
@@ -140,3 +165,72 @@ def test_main_apply_updates_hermes_auth_from_first_menubar_row(tmp_path, monkeyp
     assert [item["priority"] for item in pool] == [0, 1]
     assert updated["providers"]["openai-codex"]["tokens"]["access_token"] == "top_access"
     assert updated["providers"]["openai-codex"]["tokens"]["refresh_token"] == "top_refresh"
+
+
+def test_five_hour_prime_candidates_require_full_quota_and_full_reset_window():
+    module = load_sync_module()
+    now = 1_000_000
+    stale_full = row("auth.full.json", "full", five_hour=100)
+    stale_full["fiveHourResetAt"] = now + module.FIVE_HOUR_WINDOW_SECONDS
+    partly_used = row("auth.used.json", "used", five_hour=99)
+    partly_used["fiveHourResetAt"] = now + module.FIVE_HOUR_WINDOW_SECONDS
+    short_reset = row("auth.short.json", "short", five_hour=100)
+    short_reset["fiveHourResetAt"] = now + 120
+
+    candidates = module.five_hour_prime_candidates([stale_full, partly_used, short_reset], now_ts=now)
+
+    assert [item["id"] for item in candidates] == ["auth.full.json"]
+
+
+def test_prime_full_five_hour_rows_respects_per_account_cooldown(tmp_path, monkeypatch):
+    module = load_sync_module()
+    row_id = "auth.full.json"
+    target_row = row(row_id, "full", five_hour=100)
+    target_row["fiveHourResetAt"] = 1_000_000 + module.FIVE_HOUR_WINDOW_SECONDS
+    state_path = tmp_path / "prime-state.json"
+    state_path.write_text(
+        json.dumps({"__row_cooldowns__": {row_id: {"primed_at_ts": 1_000_000 - 60}}}),
+        encoding="utf-8",
+    )
+    calls = []
+
+    monkeypatch.setattr(module, "PRIME_STATE_PATH", state_path)
+    monkeypatch.setattr(module.time, "time", lambda: 1_000_000)
+    monkeypatch.setattr(module, "prime_five_hour_row", lambda *args, **kwargs: calls.append(args) or {"ok": True})
+
+    result = module.prime_full_five_hour_rows([target_row], model="gpt-test")
+
+    assert calls == []
+    assert result["triggered"] == []
+    assert result["skipped"] == [{"row_id": row_id, "reason": "recently_primed"}]
+
+
+def test_prime_five_hour_row_posts_minimal_codex_response(monkeypatch):
+    module = load_sync_module()
+    client = _PrimeClient()
+    monkeypatch.setattr(module.httpx, "Client", lambda timeout=15.0: client)
+    target_row = row("auth.full.json", "full", five_hour=100)
+    auth_data = {
+        "auth_mode": "chatgpt",
+        "tokens": {
+            "access_token": "access-token",
+            "refresh_token": "refresh-token",
+            "account_id": "acct_123",
+        },
+    }
+
+    result = module.prime_five_hour_row(target_row, auth_data, model="gpt-test")
+
+    assert result["ok"] is True
+    assert result["response_id"] == "resp_prime_123"
+    assert len(client.requests) == 1
+    request = client.requests[0]
+    assert request["url"] == "https://chatgpt.com/backend-api/codex/responses"
+    assert request["headers"]["Authorization"] == "Bearer access-token"
+    assert request["headers"]["ChatGPT-Account-ID"] == "acct_123"
+    assert request["json"] == {
+        "model": "gpt-test",
+        "instructions": "Reply with exactly: .",
+        "input": [{"role": "user", "content": "."}],
+        "store": False,
+    }
