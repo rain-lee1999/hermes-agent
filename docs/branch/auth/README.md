@@ -41,7 +41,9 @@
   - `instructions`: `Reply with exactly: .`
   - `input`: `.`
   - `store`: `false`
+  - `stream`: `true`（当前 Codex backend 要求 Responses endpoint 使用 streaming，否则返回 `400 Stream must be set to true`）
 - 请求不走当前 Hermes `AIAgent`，不会写入当前 session transcript，也不会改变当前会话上下文。
+- 响应按 streaming/SSE 文本处理，从 `data:` 事件里提取 response id；不要把该 endpoint 当成普通 JSON response。
 - 为防短时间重复触发，脚本有两层去重：
   - `row_id + fiveHourResetAt` 已 prime 则跳过。
   - 同 `row_id` 成功 prime 后 5 小时冷却，即使 `fiveHourResetAt` 短时间滑动也跳过。
@@ -50,6 +52,7 @@
 
 - 本文档描述的是 `/Users/rain/dev/-github/-worktree/hermes-agent-auth` 的 repo-local branch 状态。
 - `~/.hermes` 是 installed/runtime profile；auth 文件、prime state、logs、LaunchAgent 安装态属于运行时状态，不自动等同于 repo diff。
+- 2026-05-04 的 `stream=true` 修复已临时同步到 active install `/Users/rain/hermes-agent/scripts/reorder_codex_by_menubar_quota.py` 并重启 LaunchAgent，用来恢复验证 2lam 的 5 小时 prime；未来仍应把 repo branch 合并/安装到 active checkout，避免运行态漂移。
 - 当前代码改动不会直接把真实 token 写进文档；所有账号材料都应继续视为敏感运行时状态。
 
 ## 改动前的设计
@@ -69,7 +72,7 @@
   - `reorder_codex_by_menubar_quota.py --apply --prime-full-five-hour --quiet`
 - sync 脚本新增 5 小时 prime：
   - 候选检测基于 `fiveHourRemainingPercent`、`fiveHourResetAt`、`fiveHourTrendPoints`。
-  - 通过 Codex Responses endpoint 发最小非存储请求。
+  - 通过 Codex Responses endpoint 发最小非存储 streaming 请求。
   - 状态写入 `~/.hermes/codex-five-hour-prime-state.json`。
   - 每账号成功 prime 后 5 小时冷却，防止 watcher 轮询导致疯狂触发。
 - watcher 日志会输出 prime 摘要计数：
@@ -115,32 +118,43 @@
 
 ## 当前 scoped work（2026-05-04）
 
-本轮未提交改动集中在 4 个文件：
+本轮 auth/Codex scoped work 涉及的主要文件：
 
 - `scripts/reorder_codex_by_menubar_quota.py`
   - 新增 `--prime-full-five-hour` 与 `--prime-model`。
-  - 新增候选检测、最小 Codex Responses 请求、prime state、每账号 5 小时冷却。
+  - 新增候选检测、最小 Codex Responses streaming 请求、prime state、每账号 5 小时冷却。
+  - 后续修正：Codex backend 要求 `stream=true`；脚本现在按 SSE `data:` 事件解析 response id，避免 `400 Stream must be set to true`。
 - `scripts/HermesCodexAccountSyncWatcher`
   - watcher 调用 sync 时带上 `--prime-full-five-hour`。
   - watcher 摘要中加入 prime candidates/triggered/failed 计数。
 - `tests/scripts/test_reorder_codex_by_menubar_quota.py`
-  - 覆盖候选检测、最小请求 payload/header、每账号冷却。
+  - 覆盖候选检测、最小请求 payload/header、streaming response id 解析、每账号冷却。
 - `tests/scripts/test_codex_menubar_sync_watcher.py`
   - 覆盖 watcher 会启用 `--prime-full-five-hour` 并解析 prime 摘要。
+
+本轮最后一次未提交 diff 只包含 docs、`scripts/reorder_codex_by_menubar_quota.py`、`tests/scripts/test_reorder_codex_by_menubar_quota.py`；watcher 相关改动属于同一 auth scope，但当前工作区 diff 中不再显示为 unstaged。
 
 ## 验证状态
 
 最近一次验证：
+
+- `scripts/run_tests.sh tests/scripts/test_reorder_codex_by_menubar_quota.py::test_prime_five_hour_row_posts_minimal_codex_response -q`：1 passed，覆盖 `stream=true` payload 与 SSE response id 解析。
+- `scripts/run_tests.sh tests/scripts/test_reorder_codex_by_menubar_quota.py tests/scripts/test_codex_menubar_sync_watcher.py -q`：9 passed。
+- `python3 -m py_compile scripts/reorder_codex_by_menubar_quota.py`：通过。
+- `git diff --check`：通过。
+- `git check-ignore -v docs/branch/auth/README.md docs/branch/auth/ai-brief.md || true`：无输出，branch docs 未被 ignore。
+- GitNexus detect-changes（latest unstaged）：risk low；改动集中在 sync 脚本测试与 branch docs。
+- installed runtime 恢复验证：将 `stream=true` 修复同步到 `/Users/rain/hermes-agent/scripts/reorder_codex_by_menubar_quota.py`、重启 `com.hermes.codex-menubar-account-sync-watcher` 后，2lam 已成功完成一次最小 prime 并写入 cooldown；随后 dry-run/apply 检查显示 2lam `recently_primed`，未重复触发。
+
+此前同一 auth scope 的验证：
 
 - `gitnexus analyze`：通过，重新索引当前 worktree。
 - GitNexus pre-change impact：`main` / `sync_entries` 风险 LOW；改动集中在 sync 脚本流程。
 - RED：新增 prime/cooldown 测试先失败，确认测试覆盖缺失行为。
 - `scripts/run_tests.sh tests/scripts/test_reorder_codex_by_menubar_quota.py::test_five_hour_prime_candidates_require_full_quota_and_full_reset_window tests/scripts/test_reorder_codex_by_menubar_quota.py::test_prime_five_hour_row_posts_minimal_codex_response -q`：2 passed。
 - `scripts/run_tests.sh tests/scripts/test_reorder_codex_by_menubar_quota.py::test_prime_full_five_hour_rows_respects_per_account_cooldown -q`：1 passed。
-- `scripts/run_tests.sh tests/scripts/test_reorder_codex_by_menubar_quota.py tests/scripts/test_codex_menubar_sync_watcher.py -q`：9 passed。
 - `python3 scripts/reorder_codex_by_menubar_quota.py --quiet`：dry-run JSON 正常，未 apply 时不触发 prime。
-- `git diff --check`：通过。
-- GitNexus detect-changes：risk medium；受影响流程集中在 `scripts/reorder_codex_by_menubar_quota.py` 的 main/load_json/label/quota 相关路径，符合预期。
+- GitNexus detect-changes（earlier broad auth scope）：risk medium；受影响流程集中在 `scripts/reorder_codex_by_menubar_quota.py` 的 main/load_json/label/quota 相关路径，符合预期。
 
 注意：auth worktree 没有自己的 venv；测试时临时创建 `venv -> /Users/rain/hermes-agent/venv` symlink 以使用项目 wrapper，测试后已删除。
 
@@ -162,5 +176,5 @@
 
 - 新增任何 auxiliary LLM 路由，都要确认它不会绕开 active session 的绑定 credential。
 - 修改 Menubar/Hermes 同步时，必须同时考虑 pool order、provider singleton、entry token/label truth、运行时 reader 的真实选择。
-- 5 小时 prime 必须保持保守：最小请求、非存储、成功后冷却、失败不锁死。
+- 5 小时 prime 必须保持保守：最小请求、非存储、streaming、成功后冷却、失败不锁死。
 - 不要把 repo-local branch docs 与 `~/.hermes` installed runtime 状态混淆；真实 auth/token/prime state 不应进入 git 文档。

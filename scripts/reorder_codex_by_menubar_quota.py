@@ -152,6 +152,29 @@ def resolve_prime_model(explicit_model: str | None = None) -> str:
     return DEFAULT_CODEX_PRIME_MODEL
 
 
+def _extract_codex_response_id(response_text: str) -> str | None:
+    for line in str(response_text or "").splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        data_text = line[len("data:") :].strip()
+        if not data_text or data_text == "[DONE]":
+            continue
+        try:
+            event = json.loads(data_text)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        response = event.get("response")
+        if isinstance(response, dict) and isinstance(response.get("id"), str):
+            return response["id"]
+        item = event.get("item")
+        if isinstance(item, dict) and isinstance(item.get("id"), str):
+            return item["id"]
+    return None
+
+
 def prime_five_hour_row(row: dict[str, Any], auth_data: dict[str, Any], *, model: str | None = None) -> dict[str, Any]:
     tokens = auth_data.get("tokens") or {}
     access_token = str(tokens.get("access_token") or "").strip()
@@ -163,6 +186,7 @@ def prime_five_hour_row(row: dict[str, Any], auth_data: dict[str, Any], *, model
         "instructions": "Reply with exactly: .",
         "input": [{"role": "user", "content": "."}],
         "store": False,
+        "stream": True,
     }
     with httpx.Client(timeout=15.0) as client:
         response = client.post(
@@ -171,13 +195,12 @@ def prime_five_hour_row(row: dict[str, Any], auth_data: dict[str, Any], *, model
             json=payload,
         )
         response.raise_for_status()
-    body = response.json() if callable(getattr(response, "json", None)) else {}
     return {
         "ok": True,
         "row_id": row.get("id"),
         "label": label_from_row(row),
         "model": payload["model"],
-        "response_id": body.get("id") if isinstance(body, dict) else None,
+        "response_id": _extract_codex_response_id(getattr(response, "text", "")),
     }
 
 
