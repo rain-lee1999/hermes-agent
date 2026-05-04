@@ -27,8 +27,8 @@ This branch makes Hermes Codex account behavior truthful and sticky: same-sessio
 - Session-bound runtime credential: a Hermes session should keep its chosen credential until a real failover or session boundary.
 - Menubar-first ordering: `last-menu-rows.json` is already ranked; Hermes preserves that order instead of re-sorting.
 - Pool vs singleton: `credential_pool.openai-codex` and `providers.openai-codex.tokens` must converge or direct readers can use the wrong account.
-- Five-hour prime: if an account is 100% and its reset still looks like a full 5h window, send one minimal non-stored Codex response to start the window.
-- Runtime vs repo: `~/.hermes` auth/prime state is installed runtime state, not branch-local source code.
+- Five-hour prime: if an account is 100% and its reset still looks like a full 5h window, send one minimal non-stored streaming Codex response to start the window; parse the SSE `data:` stream, not plain JSON.
+- Runtime vs repo: `~/.hermes` auth/prime state is installed runtime state, not branch-local source code. The 2026-05-04 `stream=true` fix was also copied to active install `/Users/rain/hermes-agent/scripts/reorder_codex_by_menubar_quota.py` and the LaunchAgent was restarted for live recovery verification.
 
 ## Before vs after
 
@@ -42,7 +42,7 @@ This branch makes Hermes Codex account behavior truthful and sticky: same-sessio
 
 - Main and auxiliary runtime paths preserve selected credential metadata where appropriate.
 - `reorder_codex_by_menubar_quota.py` syncs Menubar-ranked rows into Hermes pool and provider singleton.
-- `--prime-full-five-hour` detects full 5h/100% rows and posts a tiny Codex Responses request with `store=false`.
+- `--prime-full-five-hour` detects full 5h/100% rows and posts a tiny Codex Responses request with `store=false` and `stream=true`; the script extracts response id from SSE events.
 - Prime state records both `row_id + fiveHourResetAt` and a 5-hour per-account cooldown to prevent short-interval repeated triggers.
 - `HermesCodexAccountSyncWatcher` now runs sync with `--prime-full-five-hour` and logs prime counts.
 
@@ -52,7 +52,7 @@ This branch makes Hermes Codex account behavior truthful and sticky: same-sessio
 2. New sessions, `/new`, and first delegate creation may choose the current highest-priority available account.
 3. Menubar row order must remain the source of truth for Hermes Codex pool priority.
 4. Pool entry labels/imported_from/account_id must match the actual token material they represent.
-5. Five-hour prime must stay minimal, non-stored, independent from current Hermes conversation history, and rate-limited per account.
+5. Five-hour prime must stay minimal, non-stored, streaming, independent from current Hermes conversation history, and rate-limited per account.
 6. Failed prime attempts must be reported but should not block normal auth sync or permanently mark the account primed.
 
 ## Where to look in code
@@ -69,7 +69,7 @@ This branch makes Hermes Codex account behavior truthful and sticky: same-sessio
 - `run_agent.py` / `cli.py`
   - selected credential propagation and session-boundary invalidation.
 - `tests/scripts/test_reorder_codex_by_menubar_quota.py`
-  - prime candidate, payload/header, cooldown regressions.
+  - prime candidate, streaming payload/header/SSE response id parsing, cooldown regressions.
 - `tests/scripts/test_codex_menubar_sync_watcher.py`
   - watcher command and summary regression.
 
@@ -81,13 +81,21 @@ Think of Codex account handling as three layers that must agree: Menubar decides
 
 Recent scoped verification:
 
+- `scripts/run_tests.sh tests/scripts/test_reorder_codex_by_menubar_quota.py::test_prime_five_hour_row_posts_minimal_codex_response -q`: 1 passed; covers `stream=true` payload and SSE response id parsing.
+- `scripts/run_tests.sh tests/scripts/test_reorder_codex_by_menubar_quota.py tests/scripts/test_codex_menubar_sync_watcher.py -q`: 9 passed.
+- `python3 -m py_compile scripts/reorder_codex_by_menubar_quota.py`: pass.
+- `git diff --check`: pass.
+- `git check-ignore -v docs/branch/auth/README.md docs/branch/auth/ai-brief.md || true`: no output; docs are not silently ignored.
+- GitNexus detect-changes, latest unstaged diff: low risk, concentrated in sync script tests and branch docs.
+- Installed runtime recovery check: copied the `stream=true` fix to `/Users/rain/hermes-agent/scripts/reorder_codex_by_menubar_quota.py`, restarted the LaunchAgent, observed successful 2lam prime and cooldown; follow-up apply reported 2lam `recently_primed` instead of repeating.
+
+Earlier same-scope verification:
+
 - `gitnexus analyze`: pass.
 - GitNexus impact on sync script symbols: LOW before editing.
 - RED/GREEN for five-hour prime and per-account cooldown: observed.
-- `scripts/run_tests.sh tests/scripts/test_reorder_codex_by_menubar_quota.py tests/scripts/test_codex_menubar_sync_watcher.py -q`: 9 passed.
 - `python3 scripts/reorder_codex_by_menubar_quota.py --quiet`: dry-run OK; no apply means no prime.
-- `git diff --check`: pass.
-- GitNexus detect-changes: medium, limited to expected sync-script flows.
+- GitNexus detect-changes, broader auth scope: medium, limited to expected sync-script flows.
 
 Testing note: this worktree lacks its own venv, so validation temporarily symlinked `venv` to `/Users/rain/hermes-agent/venv`; the symlink was removed after tests.
 
@@ -95,5 +103,5 @@ Testing note: this worktree lacks its own venv, so validation temporarily symlin
 
 - Add regressions whenever a new Codex reader could bypass pool/selected credential truth.
 - If Menubar changes its row schema or ranking semantics, update sync logic and docs together.
-- If Codex changes Responses endpoint/model allow-list, adjust `resolve_prime_model` / prime request shape with tests.
+- If Codex changes Responses endpoint/model allow-list/streaming requirement, adjust `resolve_prime_model` / prime request shape with tests.
 - Keep prime conservative: no large prompts, no transcript/session writes, no short-loop retries.

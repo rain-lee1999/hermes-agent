@@ -31,12 +31,13 @@ def row(row_id: str, display_name: str, *, weekly: int = 50, five_hour: int = 10
 
 class _PrimeResponse:
     status_code = 200
+    text = 'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_prime_123"}}\n\n'
 
     def raise_for_status(self):
         return None
 
     def json(self):
-        return {"id": "resp_prime_123"}
+        raise AssertionError("streaming Codex response is not plain JSON")
 
 
 class _PrimeClient:
@@ -233,4 +234,5 @@ def test_prime_five_hour_row_posts_minimal_codex_response(monkeypatch):
         "instructions": "Reply with exactly: .",
         "input": [{"role": "user", "content": "."}],
         "store": False,
+        "stream": True,
     }
